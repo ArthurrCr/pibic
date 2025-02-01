@@ -1,114 +1,125 @@
 import os
-from torch.utils.data import Dataset
 from PIL import Image
-from torchvision import transforms
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 class CloudDataset(Dataset):
-    def __init__(self, images_dir, masks_dir, file_list, image_transform=None, mask_transform=None):
+    def __init__(self, images_dir, masks_dir, file_list, transform=None):
+        """
+        file_list (list): lista dos nomes dos arquivos que serão usados (treino ou validação).
+        """
         self.images_dir = images_dir
         self.masks_dir = masks_dir
-        self.file_list = file_list
-        self.image_transform = image_transform
-        self.mask_transform = mask_transform
+        self.transform = transform
+        self.image_files = file_list
+        
+        if len(self.image_files) == 0:
+            raise ValueError(f"Nenhuma imagem encontrada no diretório '{images_dir}'.")
+
+        # Verificação de existência de imagem e máscara correspondente
+        for img_file in self.image_files:
+            img_path = os.path.join(self.images_dir, img_file)
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Imagem '{img_file}' não encontrada em '{self.images_dir}'.")
+            mask_path = os.path.join(self.masks_dir, img_file)
+            if not os.path.exists(mask_path):
+                raise FileNotFoundError(f"Máscara correspondente para '{img_file}' não encontrada em '{self.masks_dir}'.")
 
     def __len__(self):
-        return len(self.file_list)
-
+        return len(self.image_files)
+    
     def __getitem__(self, idx):
-        img_file = self.file_list[idx]
+        img_file = self.image_files[idx]
         img_path = os.path.join(self.images_dir, img_file)
         mask_path = os.path.join(self.masks_dir, img_file)
 
-        # Carregar imagem e máscara
-        image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')
+        # Carrega imagem e máscara
+        image = np.array(Image.open(img_path).convert('RGB'))
+        mask = np.array(Image.open(mask_path).convert('L'))
+        
+        # Ajuste o threshold conforme necessário (ex: 127 para máscaras 0-255)
+        mask = (mask > 127).astype(np.uint8)  # Binarização
 
-        # Aplicar transformações
-        if self.image_transform:
-            image = self.image_transform(image)
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+            
+            # Converte para tensor se for numpy array
+            if isinstance(mask, np.ndarray):
+                mask = torch.tensor(mask, dtype=torch.float)
+            else:
+                mask = mask.float()
+            mask = mask.unsqueeze(0)  # Adiciona dimensão do canal
         else:
-            image = transforms.ToTensor()(image)
-
-        if self.mask_transform:
-            mask = self.mask_transform(mask)
-        else:
-            mask = transforms.ToTensor()(mask)
-
-        # Converter a máscara para rótulos binários
-        mask = (mask > 0).float()
+            # Converte imagem para tensor [C, H, W] e normaliza
+            image = torch.from_numpy(image.transpose(2,0,1)).float() / 255.0
+            # Converte máscara para tensor [1, H, W]
+            mask = torch.from_numpy(mask).float().unsqueeze(0)
 
         return image, mask
     
+
+def visualize_batch(images, masks, ncols=2, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    batch_size = images.shape[0]
+    nrows = (batch_size + ncols - 1) // ncols
+    
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols*2, figsize=(8*ncols, 8*nrows))
+    axes = np.array(axes)
+    if axes.ndim == 1:
+        axes = np.expand_dims(axes, axis=0)
+    
+    idx = 0
+    for row in range(nrows):
+        for col in range(ncols):
+            if idx >= batch_size:
+                axes[row, 2*col].axis('off')
+                axes[row, 2*col+1].axis('off')
+                continue
+            
+            img = images[idx].clone()
+            msk = masks[idx].clone()
+            
+            # Desnormalização
+            for t, m, s in zip(img, mean, std):
+                t.mul_(s).add_(m)
+            img_np = img.permute(1, 2, 0).cpu().numpy()
+            img_np = np.clip(img_np, 0, 1)
+            
+            msk_np = msk.squeeze(0).cpu().numpy()
+            
+            axes[row, 2*col].imshow(img_np)
+            axes[row, 2*col].axis('off')
+            axes[row, 2*col+1].imshow(msk_np, cmap='gray')
+            axes[row, 2*col+1].axis('off')
+            
+            idx += 1
+    
+    plt.tight_layout()
+    plt.show()
+    
 class CloudTestDataset(Dataset):
-    def __init__(self, images_dir, file_list, image_transform=None):
+    def __init__(self, images_dir, file_list, transform=None):
         self.images_dir = images_dir
         self.file_list = file_list
-        self.image_transform = image_transform
-
+        self.transform = transform
+        
     def __len__(self):
         return len(self.file_list)
-
+    
     def __getitem__(self, idx):
-        img_file = self.file_list[idx]
-        img_path = os.path.join(self.images_dir, img_file)
-
-        # Carregar imagem
-        image = Image.open(img_path).convert('RGB')
-
-        # Aplicar transformações
-        if self.image_transform:
-            image = self.image_transform(image)
+        image_name = self.file_list[idx]
+        image_path = os.path.join(self.images_dir, image_name)
+        
+        image = np.array(Image.open(image_path).convert("RGB"))
+        
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented['image']
         else:
-            image = transforms.ToTensor()(image)
-
-        return image, img_file  # Retornamos o nome do arquivo para referência
-
-
-class MultiFolderDataset(Dataset):
-    def __init__(self, images_dirs, masks_dirs, file_list, image_transform=None, mask_transform=None):
-        self.images_dirs = images_dirs
-        self.masks_dirs = masks_dirs
-        self.file_list = file_list
-        self.image_transform = image_transform
-        self.mask_transform = mask_transform
-
-        # Mapear cada arquivo ao seu diretório correspondente
-        self.file_to_dir = {}
-        for img_file in file_list:
-            if os.path.exists(os.path.join(images_dirs[0], img_file)):
-                self.file_to_dir[img_file] = (images_dirs[0], masks_dirs[0])
-            elif os.path.exists(os.path.join(images_dirs[1], img_file)):
-                self.file_to_dir[img_file] = (images_dirs[1], masks_dirs[1])
-            else:
-                raise FileNotFoundError(f"Arquivo {img_file} não encontrado nos diretórios fornecidos.")
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        img_file = self.file_list[idx]
-        images_dir, masks_dir = self.file_to_dir[img_file]
-
-        img_path = os.path.join(images_dir, img_file)
-        mask_path = os.path.join(masks_dir, img_file)
-
-        # Carregar imagem e máscara
-        image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')
-
-        # Aplicar transformações
-        if self.image_transform:
-            image = self.image_transform(image)
-        else:
-            image = transforms.ToTensor()(image)
-
-        if self.mask_transform:
-            mask = self.mask_transform(mask)
-        else:
-            mask = transforms.ToTensor()(mask)
-
-        # Converter a máscara para rótulos binários
-        mask = (mask > 0).float()
-
-        return image, mask
-
+            image = torch.from_numpy(image.transpose(2,0,1)).float() / 255.0
+        
+        return image

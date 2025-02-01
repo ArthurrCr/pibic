@@ -2,103 +2,135 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1):
-        super(UNet, self).__init__()
+class ResidualDoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResidualDoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Spatial dropout para features espaciais
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout2d(0.1)
+        )
+        self.residual = nn.Identity()
+        if in_channels != out_channels:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
         
-        # Encoder
-        self.enc_conv1 = self.double_conv(in_channels, 64)
-        self.enc_conv2 = self.double_conv(64, 128)
-        self.enc_conv3 = self.double_conv(128, 256)
-        self.enc_conv4 = self.double_conv(256, 512)
-        self.enc_conv5 = self.double_conv(512, 1024)
-        
-        # Decoder
-        self.up_trans1 = self.up_trans(1024, 512)
-        self.dec_conv1 = self.double_conv(1024, 512)
-        
-        self.up_trans2 = self.up_trans(512, 256)
-        self.dec_conv2 = self.double_conv(512, 256)
-        
-        self.up_trans3 = self.up_trans(256, 128)
-        self.dec_conv3 = self.double_conv(256, 128)
-        
-        self.up_trans4 = self.up_trans(128, 64)
-        self.dec_conv4 = self.double_conv(128, 64)
-        
-        self.out = nn.Conv2d(64, out_channels, kernel_size=1)
-    
+        self.final_activation = nn.ReLU(inplace=True)
+
     def forward(self, x):
+        residual = self.residual(x)
+        x = self.conv(x)
+        x += residual
+        return self.final_activation(x)
+
+class AttentionBlock(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionBlock, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512]):
+        super(UNet, self).__init__()
+        self.ups = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        self.attention_blocks = nn.ModuleList()
+        
         # Encoder
-        x1 = self.enc_conv1(x)
-        x2 = self.enc_conv2(self.max_pool2x2(x1))
-        x3 = self.enc_conv3(self.max_pool2x2(x2))
-        x4 = self.enc_conv4(self.max_pool2x2(x3))
-        x5 = self.enc_conv5(self.max_pool2x2(x4))
+        in_ch = in_channels
+        for feature in features:
+            self.downs.append(ResidualDoubleConv(in_ch, feature))
+            in_ch = feature
         
-        # Decoder
-        d1 = self.up_trans1(x5)
-        d1 = self.crop_and_concat(d1, x4)
-        d1 = self.dec_conv1(d1)
+        # Bottleneck
+        self.bottleneck = ResidualDoubleConv(features[-1], features[-1]*2)
         
-        d2 = self.up_trans2(d1)
-        d2 = self.crop_and_concat(d2, x3)
-        d2 = self.dec_conv2(d2)
+        # Decoder com atenção
+        for feature in reversed(features):
+            self.ups.append(
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+                    nn.Conv2d(feature*2, feature, kernel_size=3, padding=1, bias=False)
+                )
+            )
+            self.attention_blocks.append(AttentionBlock(F_g=feature, F_l=feature, F_int=feature//2))
+            self.ups.append(ResidualDoubleConv(feature*2, feature))
         
-        d3 = self.up_trans3(d2)
-        d3 = self.crop_and_concat(d3, x2)
-        d3 = self.dec_conv3(d3)
+        # Camada final
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
         
-        d4 = self.up_trans4(d3)
-        d4 = self.crop_and_concat(d4, x1)
-        d4 = self.dec_conv4(d4)
-        
-        out = self.out(d4)
-        return out
-    
-    def max_pool2x2(self, x):
-        return F.max_pool2d(x, kernel_size=2, stride=2)
-    
-    def up_trans(self, in_channels, out_channels):
-        return nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size=2, stride=2
-        )
-    
-    def double_conv(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),  # Opcional: Batch Normalization
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),  # Opcional: Batch Normalization
-            nn.ReLU(inplace=True),
-        )
-    
-    def crop_and_concat(self, upsampled, bypass):
-        # Ajustar o tamanho se necessário (devido a diferenças de padding)
-        if upsampled.size()[2:] != bypass.size()[2:]:
-            diffY = bypass.size()[2] - upsampled.size()[2]
-            diffX = bypass.size()[3] - upsampled.size()[3]
-            upsampled = F.pad(upsampled, [diffX // 2, diffX - diffX // 2,
-                                          diffY // 2, diffY - diffY // 2])
-        return torch.cat((upsampled, bypass), 1)
+        # Inicialização
+        self._initialize_weights()
 
-def dice_loss(pred, target, smooth=1.):
-    pred = torch.sigmoid(pred)
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
+    def forward(self, x):
+        skip_connections = []
+        
+        # Downsampling
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = F.max_pool2d(x, 2)
+        
+        # Bottleneck
+        x = self.bottleneck(x)
+        
+        # Upsampling com atenção
+        skip_connections = skip_connections[::-1]
+        for idx in range(0, len(self.ups), 2):
+            # Upsample
+            x = self.ups[idx](x)
+            
+            # Atenção
+            skip = skip_connections[idx//2]
+            attn = self.attention_blocks[idx//2](x, skip)
+            
+            # Concatenação
+            if x.shape != attn.shape:
+                x = self._resize(x, size=attn.shape[2:])
+            x = torch.cat([attn, x], dim=1)
+            
+            # Conv dupla
+            x = self.ups[idx+1](x)
+        
+        return self.final_conv(x)
     
-    intersection = (pred * target).sum()
-    dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
-    return 1 - dice
-
-
-class BCEDiceLoss(nn.Module):
-    def __init__(self):
-        super(BCEDiceLoss, self).__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+    def _resize(self, x, size):
+        return F.interpolate(x, size=size, mode='bilinear', align_corners=True)
     
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        dice = dice_loss(pred, target)
-        return bce_loss + dice
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
