@@ -1,5 +1,20 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+"""
+class CloudLoss(nn.Module):
+    # Loss combinada para segmentação de nuvens (ZHU; WOODCOCK, 2012)
+    def __init__(self, alpha=0.7):
+        super().__init__()
+        self.alpha = alpha
+        
+    def forward(self, pred, target):
+        bce = F.binary_cross_entropy_with_logits(pred, target)
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum()
+        dice = 1 - (2. * intersection) / (pred.sum() + target.sum() + 1e-8)
+        return self.alpha * dice + (1 - self.alpha) * bce
+"""
 
 class BCE_Dice_Loss(nn.Module):
     def __init__(self, bce_weight=0.5, smooth=1e-6):

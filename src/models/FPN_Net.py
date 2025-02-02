@@ -95,12 +95,15 @@ class FPNHeadSegmentation(nn.Module):
     """Cabeça de segmentação com fusão multi-escala aprimorada"""
     def __init__(self, in_channels=256, num_classes=1):
         super().__init__()
-        
+        self.drop = nn.Dropout2d(0.1) 
         # Pesos aprendíveis para fusão (LIN et al., 2017)
         self.weights = nn.Parameter(torch.ones(4))
         self.fuse_conv = nn.Sequential(
+            self.drop,
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
             nn.ReLU(),
+            nn.Dropout2d(0.1),
             nn.Conv2d(in_channels, num_classes, 1)
         )
         
@@ -121,19 +124,6 @@ class FPNHeadSegmentation(nn.Module):
         # Combinação com características de baixo nível
         return self.fuse_conv(fused) + self.c2_conv(c2)
 
-class CloudLoss(nn.Module):
-    """Loss combinada para segmentação de nuvens (ZHU; WOODCOCK, 2012)"""
-    def __init__(self, alpha=0.7):
-        super().__init__()
-        self.alpha = alpha
-        
-    def forward(self, pred, target):
-        bce = F.binary_cross_entropy_with_logits(pred, target)
-        pred = torch.sigmoid(pred)
-        intersection = (pred * target).sum()
-        dice = 1 - (2. * intersection) / (pred.sum() + target.sum() + 1e-8)
-        return self.alpha * dice + (1 - self.alpha) * bce
-
 class CloudFPN(pl.LightningModule):
     """Modelo final integrando todas as melhorias"""
     def __init__(self, num_classes=1, crf=False):
@@ -142,7 +132,6 @@ class CloudFPN(pl.LightningModule):
         self.backbone = ResNetBackbone()
         self.fpn = FPN()
         self.head = FPNHeadSegmentation(num_classes=num_classes)
-        self.loss_fn = CloudLoss()
         self.crf = crf
 
     def forward(self, x):
