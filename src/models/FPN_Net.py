@@ -1,22 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 from torchvision.models import resnet50, ResNet50_Weights
-import pytorch_lightning as pl
 
-class GeoStatisticalLayer(nn.Module):
-    """Inspirado em TAYEBI et al. (2023) para características geoestatísticas"""
-    def __init__(self):
-        super().__init__()
-        self.gabor = nn.Conv2d(3, 16, kernel_size=5, padding=2)  # Filtros estilo Gabor
-        self.reduce = nn.Conv2d(19, 3, kernel_size=1)  # Mantém canais de entrada originais
-
-    def forward(self, x):
-        texture = self.gabor(x)
-        return self.reduce(torch.cat([x, texture], dim=1))
 
 class SpatialAttention(nn.Module):
-    """Mecanismo de atenção espacial baseado em MOHAJERANI et al. (2019a)"""
+    """Mecanismo de atenção espacial baseado em MOHAJERANI et al. (2019a)."""
     def __init__(self, in_channels):
         super().__init__()
         self.conv = nn.Sequential(
@@ -25,25 +15,58 @@ class SpatialAttention(nn.Module):
         )
     
     def forward(self, x):
+        """
+        x: Tensor (B, C, H, W)
+        Retorna: Tensor com mesmo shape, aplicando atenção no espaço.
+        """
         return x * self.conv(x)
 
+
 class ResNetBackbone(nn.Module):
-    def __init__(self):
+    """
+    Backbone ResNet-50 ajustado para lidar com 13 bandas de entrada.
+    Retorna features c2, c3, c4, c5 (camadas intermediárias).
+    """
+    def __init__(self, in_channels=13):
         super().__init__()
         base_model = resnet50(weights=ResNet50_Weights.DEFAULT)
-        
+
+        # Ajusta a conv1 para aceitar 13 canais
+        old_conv = base_model.conv1
+        base_model.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=64,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False
+        )
+        # Copia pesos dos 3 canais pré-treinados e inicializa aleatoriamente os canais extras
+        with torch.no_grad():
+            base_model.conv1.weight[:, :3, :, :] = old_conv.weight
+            init.kaiming_normal_(base_model.conv1.weight[:, 3:, :, :])
+
+        # Define as camadas conforme a arquitetura original
         self.stem = nn.Sequential(
             base_model.conv1,
             base_model.bn1,
             base_model.relu,
             base_model.maxpool
         )
-        self.layer1 = base_model.layer1
-        self.layer2 = base_model.layer2
-        self.layer3 = base_model.layer3
-        self.layer4 = base_model.layer4
+        self.layer1 = base_model.layer1  # => c2 (B, 256, H/4, W/4)
+        self.layer2 = base_model.layer2  # => c3 (B, 512, H/8, W/8)
+        self.layer3 = base_model.layer3  # => c4 (B, 1024, H/16, W/16)
+        self.layer4 = base_model.layer4  # => c5 (B, 2048, H/32, W/32)
 
     def forward(self, x):
+        """
+        x: Tensor shape (B, 13, H, W)
+        Retorna c2, c3, c4, c5
+          - c2: (B, 256, H/4,  W/4)
+          - c3: (B, 512, H/8,  W/8)
+          - c4: (B,1024, H/16, W/16)
+          - c5: (B,2048, H/32, W/32)
+        """
         x = self.stem(x)
         c2 = self.layer1(x)
         c3 = self.layer2(c2)
@@ -51,30 +74,37 @@ class ResNetBackbone(nn.Module):
         c5 = self.layer4(c4)
         return c2, c3, c4, c5
 
+
 class FPN(nn.Module):
-    """FPN melhorado com atenção espacial (LIN et al., 2017 + MOHAJERANI et al., 2019a)"""
+    """
+    FPN melhorado com atenção espacial (LIN et al., 2017 + MOHAJERANI et al., 2019a).
+    Recebe c2, c3, c4, c5 do backbone e gera p2, p3, p4, p5 com mesma dimensionalidade.
+    """
     def __init__(self, out_channels=256):
         super().__init__()
-        
-        # Camadas laterais
+        # Camadas laterais de redução para 'out_channels'
         self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(256, out_channels, 1),
-            nn.Conv2d(512, out_channels, 1),
-            nn.Conv2d(1024, out_channels, 1),
-            nn.Conv2d(2048, out_channels, 1)
+            nn.Conv2d(256,  out_channels, 1),  # para c2
+            nn.Conv2d(512,  out_channels, 1),  # para c3
+            nn.Conv2d(1024, out_channels, 1),  # para c4
+            nn.Conv2d(2048, out_channels, 1)   # para c5
         ])
         
-        # Camadas de atenção
+        # Módulos de atenção espacial em cada nível
         self.attentions = nn.ModuleList([
             SpatialAttention(out_channels) for _ in range(4)
         ])
         
-        # Suavização
+        # Convoluções de suavização (3x3) pós-fusão
         self.smooth_convs = nn.ModuleList([
             nn.Conv2d(out_channels, out_channels, 3, padding=1) for _ in range(4)
         ])
 
     def forward(self, features):
+        """
+        features: [c2, c3, c4, c5]
+        Retorna [p2, p3, p4, p5], cada um com 'out_channels'.
+        """
         c2, c3, c4, c5 = features
         
         # Projeção lateral
@@ -83,70 +113,110 @@ class FPN(nn.Module):
         p3 = self.lateral_convs[1](c3)
         p2 = self.lateral_convs[0](c2)
         
-        # Top-down com atenção
-        p4 = self.attentions[2](p4 + F.interpolate(p5, p4.shape[-2:], mode='nearest'))
-        p3 = self.attentions[1](p3 + F.interpolate(p4, p3.shape[-2:], mode='nearest'))
-        p2 = self.attentions[0](p2 + F.interpolate(p3, p2.shape[-2:], mode='nearest'))
+        # Top-down + atenção
+        p4 = self.attentions[2]( p4 + F.interpolate(p5, size=p4.shape[-2:], mode='nearest') )
+        p3 = self.attentions[1]( p3 + F.interpolate(p4, size=p3.shape[-2:], mode='nearest') )
+        p2 = self.attentions[0]( p2 + F.interpolate(p3, size=p2.shape[-2:], mode='nearest') )
         
-        # Suavização final
-        return [self.smooth_convs[i](p) for i, p in enumerate([p2, p3, p4, p5])]
+        # Não esquece que p5 também pode ter atenção
+        p5 = self.attentions[3](p5)
+
+        # Suavização (opcional, mas comum no FPN)
+        p2 = self.smooth_convs[0](p2)
+        p3 = self.smooth_convs[1](p3)
+        p4 = self.smooth_convs[2](p4)
+        p5 = self.smooth_convs[3](p5)
+        
+        return [p2, p3, p4, p5]
+
 
 class FPNHeadSegmentation(nn.Module):
-    """Cabeça de segmentação com fusão multi-escala aprimorada"""
-    def __init__(self, in_channels=256, num_classes=1):
+    """
+    Cabeça de segmentação com fusão multi-escala (LIN et al., 2017) e
+    conexão residual de características de baixo nível (RONNEBERGER et al., 2015).
+    """
+    def __init__(self, in_channels=256, num_classes=4):
+        """
+        in_channels: canais vindos do FPN (normalmente 256).
+        num_classes: número de classes (4 por padrão).
+        """
         super().__init__()
-        self.drop = nn.Dropout2d(0.1) 
-        # Pesos aprendíveis para fusão (LIN et al., 2017)
+        # Pesos aprendíveis para fusão (um para cada nível p2, p3, p4, p5)
         self.weights = nn.Parameter(torch.ones(4))
+
         self.fuse_conv = nn.Sequential(
-            self.drop,
+            nn.Dropout2d(0.2),
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
-            nn.ReLU(),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(in_channels, num_classes, 1)
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
+            nn.Conv2d(in_channels, num_classes, kernel_size=1)
         )
         
-        # Conexão residual do C2 (RONNEBERGER et al., 2015)
-        self.c2_conv = nn.Conv2d(256, num_classes, 1)
+        # Conexão residual do c2
+        self.c2_conv = nn.Conv2d(256, num_classes, kernel_size=1)
 
     def forward(self, pyramid_features, c2):
+        """
+        pyramid_features: [p2, p3, p4, p5], cada (B, 256, H/4, W/4) (por ex.)
+        c2: (B, 256, H/4, W/4) do backbone
+        Retorna: (B, num_classes, H/4, W/4) (mais tarde será upsampleado).
+        """
         p2, p3, p4, p5 = pyramid_features
         
-        # Fusão ponderada
-        h, w = p2.shape[-2:]
-        features = [
-            F.interpolate(f, (h,w), mode='bilinear') 
+        # Redimensiona tudo para o tamanho de p2 (topo da pirâmide)
+        h, w = p2.shape[-2], p2.shape[-1]
+        feats_resized = [
+            F.interpolate(f, size=(h, w), mode='bilinear', align_corners=False)
             for f in [p2, p3, p4, p5]
         ]
-        fused = sum(w*f for w,f in zip(F.softmax(self.weights,0), features))
         
-        # Combinação com características de baixo nível
-        return self.fuse_conv(fused) + self.c2_conv(c2)
+        # Fusão ponderada
+        # Normaliza os pesos para que somem 1 (via softmax)
+        w_norm = torch.softmax(self.weights, dim=0)
+        fused = 0
+        for i, f in enumerate(feats_resized):
+            fused += w_norm[i] * f  # soma ponderada
 
-class CloudFPN(pl.LightningModule):
-    """Modelo final integrando todas as melhorias"""
-    def __init__(self, num_classes=1, crf=False):
+        # Cria o mapa de previsão a partir da fusão
+        pred_fuse = self.fuse_conv(fused)
+
+        # Conexão residual de baixo nível (c2)
+        pred_c2 = self.c2_conv(c2)
+        
+        # Soma final
+        return pred_fuse + pred_c2
+
+
+class CloudFPN(nn.Module):
+    """
+    Modelo FPN final, integrando:
+      - Backbone ResNet-50 (ajustado para 13 bandas)
+      - FPN com atenção espacial
+      - Cabeça de segmentação (4 classes por padrão)
+    """
+    def __init__(self, num_classes=4):
         super().__init__()
-        self.geo_layer = GeoStatisticalLayer()
-        self.backbone = ResNetBackbone()
-        self.fpn = FPN()
-        self.head = FPNHeadSegmentation(num_classes=num_classes)
-        self.crf = crf
+        self.backbone = ResNetBackbone(in_channels=13)
+        self.fpn = FPN(out_channels=256)
+        self.head = FPNHeadSegmentation(in_channels=256, num_classes=num_classes)
 
     def forward(self, x):
-        # Pré-processamento geoestatístico
-        x = self.geo_layer(x)
+        """
+        x: Tensor (B, 13, H, W) => 13 bandas de Sentinel-2
+        Retorna: (B, num_classes, H, W)
+        """
+        original_size = x.shape[-2:]  # (H, W)
         
         # Extração de características
         c2, c3, c4, c5 = self.backbone(x)
-        pyramid = self.fpn([c2, c3, c4, c5])
         
-        # Segmentação
+        # Pirâmide de características FPN
+        pyramid = self.fpn([c2, c3, c4, c5])  # [p2, p3, p4, p5]
+
+        # Cabeça de segmentação
         logits = self.head(pyramid, c2)
-        logits = F.interpolate(logits, x.shape[-2:], mode='bilinear')
         
-        # Pós-processamento (YUAN; HU, 2015)
-        if self.crf and not self.training:
-            return self.crf_refinement(x, logits)
+        # Upsample para retornar ao tamanho original
+        logits = F.interpolate(logits, size=original_size, mode='bilinear', align_corners=False)
         return logits

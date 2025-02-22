@@ -12,7 +12,7 @@ class ResidualDoubleConv(nn.Module):
             nn.Dropout2d(0.1),  # Spatial dropout para features espaciais
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.Dropout2d(0.1)
+            nn.Dropout2d(0.1) 
         )
         self.residual = nn.Identity()
         if in_channels != out_channels:
