@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 
-class CloudFPN(nn.Module):
+class CloudDeepLab(nn.Module):
     """
-    FPN para segmentação multiespectral (13 bandas) em 4 classes exclusivas 
+    DeepLabV3+ para segmentação multiespectral (13 bandas) em 4 classes exclusivas 
     (ex.: clear, thick cloud, thin cloud, cloud shadow).
     """
     def __init__(self,
@@ -15,17 +15,17 @@ class CloudFPN(nn.Module):
                  freeze_encoder=False):
         """
         Args:
-            encoder_name (str): Nome do encoder.
-            encoder_weights (str ou None): Pesos pré-treinados para o encoder 
-                (geralmente None para 13 canais).
+            encoder_name (str): Nome do encoder (ex.: 'resnet34').
+            encoder_weights (str ou None): Pesos pré-treinados para o encoder.
+                Para 13 bandas, geralmente não há pesos pré-treinados disponíveis.
             in_channels (int): Número de canais de entrada (13 para Sentinel-2).
-            classes (int): Número de classes (ex.: 4 para clear, thick cloud, thin cloud, shadow).
+            classes (int): Número de classes (4 para clear, thick cloud, thin cloud, cloud shadow).
             freeze_encoder (bool): Se True, congela os parâmetros do encoder.
         """
-        super(CloudFPN, self).__init__()
+        super(CloudDeepLab, self).__init__()
         
-        # Cria o modelo FPN com os parâmetros especificados.
-        self.fpn = smp.FPN(
+        # Cria o modelo DeepLabV3+ com os parâmetros especificados.
+        self.deeplab = smp.DeepLabV3Plus(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
@@ -34,7 +34,7 @@ class CloudFPN(nn.Module):
         
         # Opcional: congela os parâmetros do encoder.
         if freeze_encoder:
-            for param in self.fpn.encoder.parameters():
+            for param in self.deeplab.encoder.parameters():
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -45,14 +45,14 @@ class CloudFPN(nn.Module):
             x (torch.Tensor): Tensor de entrada no formato (B, 13, H, W).
         
         Returns:
-            torch.Tensor: Logits (B, classes, H, W).
+            torch.Tensor: Logits da segmentação com shape (B, classes, H, W).
         """
-        return self.fpn(x)
+        return self.deeplab(x)
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Realiza a predição de segmentação multiclasse usando softmax e argmax.
+        Realiza a predição de segmentação multiclasse utilizando softmax e argmax.
         Cada pixel recebe um rótulo em {0, 1, 2, 3}.
         
         Args:

@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 
-class CloudFPN(nn.Module):
+class CloudPSPNet(nn.Module):
     """
-    FPN para segmentação multiespectral (13 bandas) em 4 classes exclusivas 
+    PSPNet para segmentação multiespectral (13 bandas) em 4 classes exclusivas 
     (ex.: clear, thick cloud, thin cloud, cloud shadow).
     """
     def __init__(self,
@@ -15,26 +15,26 @@ class CloudFPN(nn.Module):
                  freeze_encoder=False):
         """
         Args:
-            encoder_name (str): Nome do encoder.
+            encoder_name (str): Nome do encoder (ex.: 'resnet34').
             encoder_weights (str ou None): Pesos pré-treinados para o encoder 
-                (geralmente None para 13 canais).
-            in_channels (int): Número de canais de entrada (13 para Sentinel-2).
-            classes (int): Número de classes (ex.: 4 para clear, thick cloud, thin cloud, shadow).
+                (geralmente None para 13 bandas).
+            in_channels (int): Nº de canais de entrada (13 para Sentinel-2).
+            classes (int): Nº de classes (4 para clear, thick cloud, thin cloud, shadow).
             freeze_encoder (bool): Se True, congela os parâmetros do encoder.
         """
-        super(CloudFPN, self).__init__()
+        super(CloudPSPNet, self).__init__()
         
-        # Cria o modelo FPN com os parâmetros especificados.
-        self.fpn = smp.FPN(
+        # Cria o modelo PSPNet com os parâmetros especificados.
+        self.pspnet = smp.PSPNet(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
         )
         
-        # Opcional: congela os parâmetros do encoder.
+        # Opcional: congela os parâmetros do encoder
         if freeze_encoder:
-            for param in self.fpn.encoder.parameters():
+            for param in self.pspnet.encoder.parameters():
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,27 +42,27 @@ class CloudFPN(nn.Module):
         Executa o forward pass do modelo.
         
         Args:
-            x (torch.Tensor): Tensor de entrada no formato (B, 13, H, W).
+            x (torch.Tensor): Tensor (B, 13, H, W).
         
         Returns:
             torch.Tensor: Logits (B, classes, H, W).
         """
-        return self.fpn(x)
+        return self.pspnet(x)
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Realiza a predição de segmentação multiclasse usando softmax e argmax.
-        Cada pixel recebe um rótulo em {0, 1, 2, 3}.
+        Realiza a predição multiclasse usando softmax + argmax.
+        Cada pixel recebe o rótulo mais provável em {0,1,2,3}.
         
         Args:
-            x (torch.Tensor): Tensor de entrada (B, 13, H, W).
+            x (torch.Tensor): Tensor (B, 13, H, W).
         
         Returns:
-            torch.Tensor: Mapa de rótulos (B, H, W) com valores em {0, 1, 2, 3}.
+            torch.Tensor: Mapa de rótulos (B, H, W) com valores em {0,1,2,3}.
         """
         self.eval()
-        logits = self.forward(x)              # (B, classes, H, W)
-        probs = torch.softmax(logits, dim=1)  # (B, classes, H, W)
+        logits = self.forward(x)              # (B, 4, H, W)
+        probs = torch.softmax(logits, dim=1)  # (B, 4, H, W)
         labels = probs.argmax(dim=1)          # (B, H, W)
         return labels

@@ -34,6 +34,8 @@ class EarlyStopping:
         if self.counter >= self.patience:
             self.early_stop = True
 
+
+
 def train_model_multiclass(
     model,
     train_loader,
@@ -44,86 +46,32 @@ def train_model_multiclass(
     checkpoint_dir=None,
     resume_checkpoint=None,
     save_best=True,
-    metric_to_monitor="val_iou",
-    mode="max",
+    metric_to_monitor="val_loss",
+    mode="min",
     patience=3,
     min_delta=1e-4,
-    use_early_stopping=True
+    use_early_stopping=True,
 ):
     """
     Função de treinamento para segmentação com 4 classes (multi-classes).
-
-    Parâmetros:
-    -----------
-    model : nn.Module
-        Modelo que retorna shape (B, 4, H, W).
-    train_loader : DataLoader
-        DataLoader com as amostras de treino. imgs: (B, C, H, W), masks: (B, H, W) ou (B, 1, H, W).
-    val_loader : DataLoader
-        DataLoader com as amostras de validação no mesmo formato.
-    num_epochs : int
-        Número de épocas de treinamento.
-    lr : float
-        Taxa de aprendizado.
-    device : str
-        "cuda" ou "cpu".
-    checkpoint_dir : str
-        Diretório para salvar checkpoints.
-    resume_checkpoint : str ou None
-        Caminho para retomar treinamento de um checkpoint existente.
-    save_best : bool
-        Se True, salva o modelo que obtiver a melhor métrica monitorada (metric_to_monitor).
-    metric_to_monitor : str
-        Pode ser "val_iou", "val_acc" ou "val_loss".
-    mode : str
-        "max" se a métrica deva ser maximizada, "min" se deva ser minimizada.
-    patience : int
-        Paciência do early stopping.
-    min_delta : float
-        Melhora mínima para resetar a paciência.
-    use_early_stopping : bool
-        Se True, ativa early stopping.
-
-    Retorna:
-    --------
-    history : dict
-        Dicionário com histórico de perdas e métricas em cada época.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Usaremos CrossEntropyLoss para multi-classe (4 classes)
     criterion = nn.CrossEntropyLoss()
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, mode=mode, factor=0.1, patience=3, verbose=True)
 
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler()
 
     early_stopping = EarlyStopping(patience=patience, mode=mode, min_delta=min_delta) if use_early_stopping else None
     best_metric = -np.inf if mode == "max" else np.inf
     best_epoch = -1
     start_epoch = 0
 
-    # Retomar checkpoint, se especificado
-    if resume_checkpoint is not None and os.path.isfile(resume_checkpoint):
-        print(f"Carregando checkpoint '{resume_checkpoint}'")
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_metric = checkpoint.get('best_metric', best_metric)
-        print(f"Retomando da época {start_epoch} com best_metric={best_metric:.4f}")
-
-    # Métricas multi-classe: 4 classes
-    train_acc_metric = MulticlassAccuracy(num_classes=4, average='macro').to(device)
-    train_iou_metric = MulticlassJaccardIndex(num_classes=4, average='macro').to(device)
-    val_acc_metric   = MulticlassAccuracy(num_classes=4, average='macro').to(device)
-    val_iou_metric   = MulticlassJaccardIndex(num_classes=4, average='macro').to(device)
-
+    # Histórico de métricas
     history = {
         "train_loss": [],
         "val_loss": [],
@@ -132,6 +80,25 @@ def train_model_multiclass(
         "train_iou": [],
         "val_iou": []
     }
+
+    # Retomar checkpoint, se especificado
+    if resume_checkpoint is not None and os.path.isfile(resume_checkpoint):
+        print(f"Carregando checkpoint '{resume_checkpoint}'")
+        checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_metric = checkpoint.get('best_metric', best_metric)
+        best_epoch = checkpoint.get('best_epoch', best_epoch)
+        history = checkpoint.get('history', history)  # Recupera o histórico salvo, se existir
+        print(f"Retomando da época {start_epoch} com best_metric={best_metric:.4f}")
+
+    # Métricas multi-classe: 4 classes
+    train_acc_metric = MulticlassAccuracy(num_classes=4, average='macro').to(device)
+    train_iou_metric = MulticlassJaccardIndex(num_classes=4, average='macro').to(device)
+    val_acc_metric   = MulticlassAccuracy(num_classes=4, average='macro').to(device)
+    val_iou_metric   = MulticlassJaccardIndex(num_classes=4, average='macro').to(device)
 
     use_amp = (device.type == 'cuda')
 
@@ -145,19 +112,21 @@ def train_model_multiclass(
         loop_train = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] (Train)")
 
         for images, masks in loop_train:
-            # images => (B, C, H, W)
-            # masks  => (B, H, W) ou (B, 1, H, W) com valores 0..3
             images = images.to(device, non_blocking=True)
-            if masks.dim() == 4:  
-                # Se vier shape (B,1,H,W), converte para (B,H,W)
-                masks = masks.squeeze(1)
+            if masks.dim() == 4:
+                if masks.shape[1] == 1:
+                    masks = masks.squeeze(1)
+                elif masks.shape[-1] == 1:
+                    masks = masks.squeeze(-1)
             masks = masks.long().to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type="cuda", enabled=False):
-                outputs = model(images)  # (B, 4, H, W)
-                loss_value = criterion(outputs, masks)
+            # Forward pass
+            outputs = model(images)  # (B, 4, H, W)
+
+            # Calcular a perda
+            loss_value = criterion(outputs, masks)
 
             if use_amp:
                 scaler.scale(loss_value).backward()
@@ -192,13 +161,15 @@ def train_model_multiclass(
             for images, masks in loop_val:
                 images = images.to(device, non_blocking=True)
                 if masks.dim() == 4:
-                    masks = masks.squeeze(1)
+                    if masks.shape[1] == 1:
+                        masks = masks.squeeze(1)
+                    elif masks.shape[-1] == 1:
+                        masks = masks.squeeze(-1)
                 masks = masks.long().to(device, non_blocking=True)
 
-                with torch.amp.autocast(device_type="cuda", enabled=False):
-                    outputs = model(images)  # (B, 4, H, W)
-                    loss_value = criterion(outputs, masks)
-
+                # Forward pass
+                outputs = model(images)  # (B, 4, H, W)
+                loss_value = criterion(outputs, masks)
                 epoch_val_loss += loss_value.item()
 
                 preds = torch.argmax(outputs, dim=1)
@@ -255,7 +226,9 @@ def train_model_multiclass(
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scaler_state_dict': scaler.state_dict(),
-                    'best_metric': best_metric
+                    'best_metric': best_metric,
+                    'best_epoch': best_epoch,
+                    'history': history
                 }, best_model_path)
                 print(f"[Melhoria] Modelo salvo com {metric_to_monitor}: {best_metric:.4f} na época {epoch+1}.")
 
@@ -266,7 +239,9 @@ def train_model_multiclass(
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
-            'best_metric': best_metric
+            'best_metric': best_metric,
+            'best_epoch': best_epoch,
+            'history': history
         }, checkpoint_path)
         print(f"Checkpoint salvo em '{checkpoint_path}'.")
 
@@ -283,3 +258,4 @@ def train_model_multiclass(
 
     print(f"Treinamento finalizado. Melhor {metric_to_monitor}: {best_metric:.4f} na época {best_epoch}.")
     return history
+

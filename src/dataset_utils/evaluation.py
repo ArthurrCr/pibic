@@ -1,83 +1,133 @@
 import rasterio
+import tempfile
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import jaccard_score, f1_score, recall_score, precision_score
-from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib import colors
+import numpy.ma as ma
+import tensorflow as tf
 from s2cloudless import S2PixelCloudDetector
 
-def generate_mask(sample):
-    # --- Leitura e normalização das bandas ---
-    with rasterio.open(sample.read(0)) as src:
-        bands = src.read(range(1, src.count + 1))
-    bands = bands.transpose(1, 2, 0)  # shape: (H, W, 13)
-    bands = bands / 10000.0
 
-    # --- Inicializa o detector s2cloudless ---
-    cloud_detector = S2PixelCloudDetector(threshold=0.3, all_bands=True, average_over=4, dilation_size=2)
-
-    # --- Adiciona dimensão de lote (batch) ---
-    bands_batch = bands[np.newaxis, ...]  # shape: (1, H, W, 13)
-
-    # --- Gera a máscara binária de nuvens ---
-    cloud_masks = cloud_detector.get_cloud_masks(bands_batch)
-    cloud_mask = cloud_masks[0]  # Remove a dimensão de lote: (H, W)
-
-    return cloud_mask.astype(np.uint8)
-
-def compute_metrics(sample, gt_mask, pred_mask):
+def generate_mask_s2cloudless(bands_array, threshold, avg_over, dil_size):
     """
-    Calcula as métricas (IoU, F1, Recall, Precision) entre a ground truth e a máscara predita.
-    
-    Ambos devem ser arrays 2D com os mesmos valores (0 para clear, 1 para cloud, 2 para shadow).
+    bands_array: array (H, W, 13) (float ou uint16 normalizado).
+    Retorna np.uint8 (0 ou 1) como máscara de nuvem.
     """
-    # --- Leitura e remapeamento da máscara ground truth ---
-    with rasterio.open(sample.read(1)) as src_mask:
-        ground_truth = src_mask.read(1)
-    # Remapeamento:
-    # - Mantém Thick Cloud (1)
-    # - Converte o resto pra 0
-    gt_mask = np.where(ground_truth == 1, 1, 0)
 
-    gt_flat = gt_mask.flatten().astype(np.uint8)
-    pred_flat = pred_mask.flatten().astype(np.uint8)
-    iou = jaccard_score(gt_flat, pred_flat, average=None, labels=[0, 1], zero_division=0)
-    metrics = {
-        "IoU_Clear": iou[0],
-        "IoU_Cloud": iou[1],
-        "F1": f1_score(gt_flat, pred_flat, average="macro", zero_division=0),
-        "Recall": recall_score(gt_flat, pred_flat, average="macro", zero_division=0),
-        "Precision": precision_score(gt_flat, pred_flat, average="macro", zero_division=0)
-    }
-    return metrics
+    cloud_detector = S2PixelCloudDetector(
+        threshold=threshold,
+        all_bands=True,
+        average_over=avg_over,
+        dilation_size=dil_size
+    )
+    # s2cloudless pede shape (batch, H, W, C)
+    batch = bands_array[np.newaxis, ...]  # (1, H, W, 13)
+    mask = cloud_detector.get_cloud_masks(batch)[0]
+    return mask.astype(np.uint8)
 
-def visualize_results(sample, gt_mask, pred_mask):
-    from matplotlib import colors
-    # Carrega a imagem RGB local (supondo que os canais 4, 3, 2 correspondem a RGB)
+
+def compute_confusion_matrix_4classes(gt_flat, pred_flat):
+    """
+    Computa a matriz de confusão 4x4 (classes 0..3).
+    Mesmo se a predição não tiver classe 2 ou 3, as colunas/linhas ficam zeradas.
+    """
+    cm = np.zeros((4, 4), dtype=np.int64)
+    for g, p in zip(gt_flat, pred_flat):
+        cm[g, p] += 1
+    return cm
+
+def compute_metrics_from_cm(cm):
+    """
+    Extrai métricas one-vs-all para classes 0, 1 e 3.
+    Ignoramos explicitamente a classe 2 ('thin cloud').
+    """
+    eps = 1e-7
+    results = {}
+    # classes que queremos avaliar (0=clear, 1=thick cloud, 3=shadow)
+    classes_interesse = [0, 1, 3]
+
+    for c in classes_interesse:
+        TP = cm[c, c]
+        FP = np.sum(cm[:, c]) - TP
+        FN = np.sum(cm[c, :]) - TP
+
+        precision = TP / (TP + FP + eps)
+        recall    = TP / (TP + FN + eps)
+        f1        = 2 * precision * recall / (precision + recall + eps)
+        iou       = TP / (TP + FP + FN + eps)
+
+        results[f"precision_{c}"] = float(precision)
+        results[f"recall_{c}"]    = float(recall)
+        results[f"f1_{c}"]        = float(f1)
+        results[f"iou_{c}"]       = float(iou)
+
+    return results
+
+def compute_metrics(gt_array, pred_mask):
+    """
+    gt_array:  (H, W) com valores em {0,1,2,3} => 0=clear,1=thick,2=thin,3=shadow
+    pred_mask: (H, W) com valores em {0,1,3} => 0=clear,1=cloud,3=shadow
+    Retorna métricas para classes 0,1,3. A classe 2 é ignorada no cálculo.
+    """
+    gt_flat   = gt_array.flatten()
+    pred_flat = pred_mask.flatten()
+
+    cm = compute_confusion_matrix_4classes(gt_flat, pred_flat)
+    return compute_metrics_from_cm(cm)
+
+def visualize_results(sample, cloud_mask, shadow_mask):
+    """
+    Exemplo de função para visualizar:
+    (1) imagem RGB, (2) ground truth (0,1,2,3) e (3) predição combinada (0=clear,1=cloud,3=shadow).
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as colors
+
+    # Ler a imagem RGB (usando bandas 4,3,2)
     with rasterio.open(sample.read(0)) as src:
-        # Lê os canais 4, 3 e 2
-        bands = src.read([4, 3, 2])
-    rgb = bands.transpose(1, 2, 0).astype(np.float32)
-    # Normaliza para visualização
+        bands = src.read([4, 3, 2])  # shape: (3, H, W)
+    rgb = bands.transpose(1, 2, 0).astype(np.float32)  # (H, W, 3)
     perc = np.percentile(rgb, 98)
     rgb = np.clip(rgb / perc, 0, 1)
 
-    # Define os mapas de cor customizados
-    # Para ground truth: 0 (clear) → branco, 1 (thick cloud) → azul
-    cmap_gt = colors.ListedColormap(['white', 'blue'])
-    cmap_pred = colors.ListedColormap(['white', 'blue'])
+    # Ler a ground truth (banda 1)
+    with rasterio.open(sample.read(1)) as src_mask:
+        ground_truth_full = src_mask.read(1)  # shape: (H, W)
 
-    # Cria a figura com três subplots
+    # Predição 3-classes: 0=clear,1=cloud,3=shadow
+    pred_3class = np.zeros_like(cloud_mask, dtype=np.uint8)
+    pred_3class[cloud_mask == 1]  = 1
+    pred_3class[shadow_mask == 1] = 3
+
+    # Configura a exibição da GT:
+    #   0 -> white
+    #   1 -> blue
+    #   2 -> yellow
+    #   3 -> gray
+    cmap_gt = colors.ListedColormap(["white", "blue", "yellow", "gray"])
+
+    # Configura a exibição da predição:
+    #   0 -> white
+    #   1 -> blue
+    #   3 -> gray
+    # (Aqui, a classe 2 não existe)
+    cmap_pred = colors.ListedColormap(["white", "blue", "gray"])
+
     fig, ax = plt.subplots(1, 3, figsize=(18, 6))
 
+    # 1) Imagem RGB
     ax[0].imshow(rgb)
-    ax[0].set_title("Imagem RGB Local")
+    ax[0].set_title("Imagem RGB")
     ax[0].axis("off")
 
-    ax[1].imshow(gt_mask, cmap=cmap_gt, vmin=0, vmax=1)
+    # 2) Ground Truth (0,1,2,3)
+    ax[1].imshow(ground_truth_full, cmap=cmap_gt, vmin=0, vmax=3)
     ax[1].set_title("Ground Truth")
     ax[1].axis("off")
 
-    ax[2].imshow(pred_mask, cmap=cmap_pred, vmin=0, vmax=1)
+    # 3) Predição (0,1,3)
+    ax[2].imshow(pred_3class, cmap=cmap_pred, vmin=0, vmax=3)
     ax[2].set_title("Predição")
     ax[2].axis("off")
 

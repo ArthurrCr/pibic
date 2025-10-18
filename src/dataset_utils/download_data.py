@@ -1,7 +1,7 @@
 import os
 from huggingface_hub import hf_hub_download
 
-def download_cloudsen12plus(local_dir="./data/dados", type =""):
+def download_cloudsen12(local_dir="./data/dados", type =""):
     """
     Baixa as partes do CloudSEN12+ (modo L1C) para o diretório especificado.
     Se a pasta não existir, ela será criada.
@@ -87,3 +87,4 @@ def download_cloudsen12plus(local_dir="./data/dados", type =""):
       )
 
     return [part1,part5] # para evitar ter que baixar tudo, baixa só as partes que estão a label high
+
