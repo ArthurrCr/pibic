@@ -94,6 +94,7 @@ def train_model(
     patience: int = 3,
     min_delta: float = 1e-4,
     use_early_stopping: bool = True,
+    loss_fn: Optional[nn.Module] = None
 ) -> Dict[str, list]:
     """
     Train a multiclass segmentation model.
@@ -123,7 +124,7 @@ def train_model(
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()  
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
         optimizer, mode=mode, factor=0.1, patience=3, verbose=True
