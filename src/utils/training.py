@@ -123,8 +123,12 @@ def train_model(
 
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
-
-    criterion = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()  
+    
+    if loss_fn is not None:
+        criterion = loss_fn.to(device)
+    else:
+        criterion = nn.CrossEntropyLoss()
+        
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
         optimizer, mode=mode, factor=0.1, patience=3, verbose=True

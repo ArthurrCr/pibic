@@ -1,10 +1,10 @@
-"""Experiment runner for cloud segmentation models."""
+"""Experiment runner for cloud segmentation."""
 
 import os
 import pickle
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 import pandas as pd
 import torch
@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from utils.constants import CLASS_NAMES
 from utils.dataset import create_dataloaders
+from utils.losses import get_loss
 from utils.metrics import compute_metrics, evaluate_model
 from utils.boa_metrics import evaluate_test_dataset
 from utils.training import train_model
@@ -23,7 +24,7 @@ class ExperimentConfig:
     
     name: str
     model_class: Type[nn.Module]
-    encoder_name: str
+    encoder_name: str = "tu-regnetz_d8"
     encoder_weights: Optional[str] = None
     in_channels: int = 13
     num_classes: int = 4
@@ -31,25 +32,12 @@ class ExperimentConfig:
     learning_rate: float = 1e-4
     num_epochs: int = 50
     patience: int = 10
-    metric_to_monitor: str = "val_loss"
-    mode: str = "min"
-    loss_fn: Optional[Callable] = None
-    loss_name: str = "CrossEntropyLoss"
-
-
-@dataclass
-class ExperimentResult:
-    """Results from a single experiment."""
+    loss_name: str = "ce"
+    loss_kwargs: Dict = None
     
-    config: Dict
-    boa_metrics: pd.DataFrame
-    confusion_matrix: Any
-    per_class_metrics: Dict
-    overall_accuracy: float
-    best_epoch: int
-    best_metric: float
-    history: Dict
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    def __post_init__(self):
+        if self.loss_kwargs is None:
+            self.loss_kwargs = {}
 
 
 class ExperimentRunner:
@@ -61,41 +49,22 @@ class ExperimentRunner:
         base_dir: str = "/content/drive/MyDrive/pibic",
         device: str = "cuda",
     ):
-        """
-        Initialize the experiment runner.
-
-        Args:
-            parts: Dataset parts from download_cloudsen12.
-            base_dir: Base directory for saving checkpoints and results.
-            device: Device for training and evaluation.
-        """
         self.parts = parts
         self.base_dir = base_dir
         self.device = device
-        self.results: List[ExperimentResult] = []
+        self.results: List[Dict] = []
 
         self.checkpoints_dir = os.path.join(base_dir, "checkpoints")
         self.results_dir = os.path.join(base_dir, "results")
         os.makedirs(self.checkpoints_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
 
-    def run(
-        self,
-        config: ExperimentConfig,
-        resume: bool = True,
-    ) -> ExperimentResult:
-        """
-        Run a single experiment.
-
-        Args:
-            config: Experiment configuration.
-            resume: If True, resumes from checkpoint if available.
-
-        Returns:
-            ExperimentResult with all metrics.
-        """
+    def run(self, config: ExperimentConfig, resume: bool = True) -> Dict:
+        """Run a single experiment."""
+        
         print(f"\n{'='*60}")
         print(f"Experiment: {config.name}")
+        print(f"Loss: {config.loss_name} | LR: {config.learning_rate} | BS: {config.batch_size}")
         print(f"{'='*60}")
 
         checkpoint_dir = os.path.join(self.checkpoints_dir, config.name)
@@ -119,13 +88,14 @@ class ExperimentRunner:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"Parameters: {n_params:,}")
 
-        # Resume checkpoint
+        # Loss
+        loss_fn = get_loss(config.loss_name, **config.loss_kwargs)
+        print(f"Loss function: {loss_fn.__class__.__name__}")
+
+        # Resume
         resume_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         if not resume or not os.path.isfile(resume_path):
             resume_path = None
-            print("Starting from scratch")
-        else:
-            print(f"Resuming from: {resume_path}")
 
         # Train
         history = train_model(
@@ -137,10 +107,10 @@ class ExperimentRunner:
             device=self.device,
             checkpoint_dir=checkpoint_dir,
             resume_checkpoint=resume_path,
-            metric_to_monitor=config.metric_to_monitor,
-            mode=config.mode,
+            metric_to_monitor="val_loss",
+            mode="min",
             patience=config.patience,
-            loss_fn=config.loss_fn,
+            loss_fn=loss_fn,
         )
 
         # Load best model
@@ -150,100 +120,91 @@ class ExperimentRunner:
         model.to(self.device).eval()
 
         # Evaluate
-        df_boa = evaluate_test_dataset(
-            test_loader, model, device=self.device, normalize_imgs=False
-        )
-        conf_matrix = evaluate_model(
-            test_loader, model, device=self.device, normalize_imgs=False
-        )
+        df_boa = evaluate_test_dataset(test_loader, model, device=self.device, normalize_imgs=False)
+        conf_matrix = evaluate_model(test_loader, model, device=self.device, normalize_imgs=False)
         metrics = compute_metrics(conf_matrix)
 
-        # Build result
-        result = ExperimentResult(
-            config=asdict(config) | {"n_parameters": n_params},
-            boa_metrics=df_boa,
-            confusion_matrix=conf_matrix,
-            per_class_metrics={c: metrics[c] for c in CLASS_NAMES},
-            overall_accuracy=metrics["Overall"]["Accuracy"],
-            best_epoch=checkpoint.get("best_epoch", -1),
-            best_metric=checkpoint.get("best_metric", 0.0),
-            history=history,
-        )
+        # Extract BOA values
+        cloud_boa = float(df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0])
+        shadow_boa = float(df_boa[df_boa["Experiment"] == "cloud shadow"]["Median BOA"].values[0])
+        valid_boa = float(df_boa[df_boa["Experiment"] == "valid/invalid"]["Median BOA"].values[0])
+
+        result = {
+            "name": config.name,
+            "loss": config.loss_name,
+            "lr": config.learning_rate,
+            "batch_size": config.batch_size,
+            "cloud_boa": cloud_boa,
+            "shadow_boa": shadow_boa,
+            "valid_boa": valid_boa,
+            "accuracy": metrics["Overall"]["Accuracy"],
+            "best_epoch": checkpoint.get("best_epoch", -1),
+            "n_params": n_params,
+            "timestamp": datetime.now().isoformat(),
+        }
 
         self.results.append(result)
-        self._save_result(result)
+        self._save_results()
 
-        print(f"\nBOA Metrics:")
-        print(df_boa.to_string(index=False))
-        print(f"\nOverall Accuracy: {result.overall_accuracy:.4f}")
+        print(f"\nResults:")
+        print(f"  Cloud BOA:  {cloud_boa:.4f}")
+        print(f"  Shadow BOA: {shadow_boa:.4f}")
+        print(f"  Valid BOA:  {valid_boa:.4f}")
+        print(f"  Accuracy:   {metrics['Overall']['Accuracy']:.4f}")
 
         return result
 
-    def run_grid(
+    def run_loss_comparison(self, model_class: Type[nn.Module]) -> pd.DataFrame:
+        """Etapa 1: Compare loss functions with fixed hyperparameters."""
+        
+        losses = ["ce", "dice_ce", "focal", "focal_tversky", "dice_focal"]
+        
+        for loss_name in losses:
+            config = ExperimentConfig(
+                name=f"loss_comparison_{loss_name}",
+                model_class=model_class,
+                loss_name=loss_name,
+                learning_rate=1e-4,
+                batch_size=4,
+            )
+            self.run(config, resume=True)
+        
+        return self.get_summary()
+
+    def run_hyperparameter_tuning(
         self,
-        configs: List[ExperimentConfig],
-        resume: bool = True,
+        model_class: Type[nn.Module],
+        best_loss: str,
     ) -> pd.DataFrame:
-        """
-        Run multiple experiments.
-
-        Args:
-            configs: List of experiment configurations.
-            resume: If True, resumes from checkpoints.
-
-        Returns:
-            DataFrame summarizing all results.
-        """
-        for config in configs:
-            try:
-                self.run(config, resume=resume)
-            except Exception as e:
-                print(f"Error in {config.name}: {e}")
-                continue
-
+        """Etapa 2: Tune hyperparameters with best loss."""
+        
+        learning_rates = [5e-4, 1e-4, 5e-5]
+        batch_sizes = [4, 8]
+        
+        for lr in learning_rates:
+            for bs in batch_sizes:
+                config = ExperimentConfig(
+                    name=f"hp_tuning_{best_loss}_lr{lr}_bs{bs}",
+                    model_class=model_class,
+                    loss_name=best_loss,
+                    learning_rate=lr,
+                    batch_size=bs,
+                )
+                self.run(config, resume=True)
+        
         return self.get_summary()
 
     def get_summary(self) -> pd.DataFrame:
         """Get summary DataFrame of all results."""
-        rows = []
-        for r in self.results:
-            cloud_boa = float(
-                r.boa_metrics[r.boa_metrics["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0]
-            )
-            shadow_boa = float(
-                r.boa_metrics[r.boa_metrics["Experiment"] == "cloud shadow"]["Median BOA"].values[0]
-            )
-            valid_boa = float(
-                r.boa_metrics[r.boa_metrics["Experiment"] == "valid/invalid"]["Median BOA"].values[0]
-            )
-
-            rows.append({
-                "name": r.config["name"],
-                "encoder": r.config["encoder_name"],
-                "loss": r.config["loss_name"],
-                "lr": r.config["learning_rate"],
-                "batch_size": r.config["batch_size"],
-                "cloud_boa": cloud_boa,
-                "shadow_boa": shadow_boa,
-                "valid_boa": valid_boa,
-                "accuracy": r.overall_accuracy,
-                "best_epoch": r.best_epoch,
-                "n_params": r.config["n_parameters"],
-            })
-
-        df = pd.DataFrame(rows)
-        df = df.sort_values("cloud_boa", ascending=False)
+        df = pd.DataFrame(self.results)
+        if not df.empty:
+            df = df.sort_values("cloud_boa", ascending=False)
         return df
 
-    def _save_result(self, result: ExperimentResult) -> None:
-        """Save result to disk."""
-        name = result.config["name"]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.results_dir, f"{name}_{timestamp}.pkl")
-
-        with open(path, "wb") as f:
-            pickle.dump(result, f)
-
-        # Also save summary CSV
-        summary = self.get_summary()
-        summary.to_csv(os.path.join(self.results_dir, "summary.csv"), index=False)
+    def _save_results(self) -> None:
+        """Save results to disk."""
+        df = self.get_summary()
+        df.to_csv(os.path.join(self.results_dir, "experiments_summary.csv"), index=False)
+        
+        with open(os.path.join(self.results_dir, "experiments_full.pkl"), "wb") as f:
+            pickle.dump(self.results, f)
