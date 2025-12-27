@@ -1,67 +1,87 @@
+"""U-Net segmentation models for cloud detection in Sentinel-2 imagery."""
+
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 
-class CloudUNetPlusPlus(nn.Module):
+
+class CloudSegmentationModel(nn.Module):
     """
-    U-Net++ para segmentação multiespectral (13 bandas),
-    com 4 classes exclusivas (p. ex.: clear, thick cloud, thin cloud, cloud shadow).
+    U-Net segmentation model for cloud detection in Sentinel-2 images.
+
+    Supports multiple encoder backbones and can be configured for different
+    numbers of input bands and output classes.
+
+    Attributes:
+        unet: The underlying U-Net model from segmentation_models_pytorch.
     """
-    def __init__(self,
-                 encoder_name='resnet34',
-                 encoder_weights=None,
-                 in_channels=13,
-                 classes=4,
-                 freeze_encoder=False):
+
+    def __init__(
+        self,
+        encoder_name: str = "mobilenet_v2",
+        encoder_weights: Optional[str] = None,
+        in_channels: int = 13,
+        num_classes: int = 4,
+        freeze_encoder: bool = False,
+    ):
         """
+        Initialize the cloud segmentation model.
+
         Args:
-            encoder_name (str): Nome do backbone (ex.: 'resnet34').
-            encoder_weights (str ou None): Pesos pré-treinados para o encoder (geralmente None para 13 bandas).
-            in_channels (int): Número de canais de entrada (13 para Sentinel-2).
-            classes (int): Número de classes (4 para clear, thick cloud, thin cloud, shadow).
-            freeze_encoder (bool): Se True, congela os parâmetros do encoder.
+            encoder_name: Name of the encoder backbone. Examples:
+                - "mobilenet_v2": MobileNetV2 (lightweight)
+                - "tu-regnetz_d8": RegNetZ-D8 via timm
+            encoder_weights: Pretrained weights for encoder. Usually None
+                for multi-band inputs since pretrained weights expect 3 channels.
+            in_channels: Number of input bands (default: 13 for Sentinel-2).
+            num_classes: Number of output classes. Default is 4:
+                0=clear, 1=thick cloud, 2=thin cloud, 3=cloud shadow.
+            freeze_encoder: If True, freeze encoder parameters during training.
         """
-        super(CloudUNetPlusPlus, self).__init__()
-        
-        # Cria o modelo U-Net++ com os parâmetros especificados.
-        self.unetplusplus = smp.UnetPlusPlus(
+        super().__init__()
+
+        self.unet = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
-            classes=classes,
+            classes=num_classes,
         )
-        
-        # Opcional: congela parâmetros do encoder
+
         if freeze_encoder:
-            for param in self.unetplusplus.encoder.parameters():
+            for param in self.unet.encoder.parameters():
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass do modelo.
-        
+        Forward pass of the model.
+
         Args:
-            x (torch.Tensor): Tensor (B, 13, H, W).
-        
+            x: Input tensor with shape (B, in_channels, H, W).
+
         Returns:
-            torch.Tensor: Logits (B, classes, H, W).
+            Output logits with shape (B, num_classes, H, W).
         """
-        return self.unetplusplus(x)
+        return self.unet(x)
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Faz predição multiclasse usando softmax + argmax.
-        Cada pixel recebe um rótulo em {0,1,2,3}.
-        
+        Predict class labels for each pixel.
+
+        Applies softmax to get probability distribution, then argmax
+        to determine the most likely class.
+
         Args:
-            x (torch.Tensor): Tensor (B, 13, H, W).
-        
+            x: Input tensor with shape (B, in_channels, H, W).
+
         Returns:
-            torch.Tensor: Mapa de rótulos (B, H, W).
+            Class mask with shape (B, H, W), where each pixel value
+            is in {0, 1, 2, 3}.
         """
         self.eval()
-        logits = self.forward(x)                  # (B, 4, H, W)
-        probs = torch.softmax(logits, dim=1)      # (B, 4, H, W)
-        labels = probs.argmax(dim=1)              # (B, H, W)
+        logits = self.forward(x)
+        probs = torch.softmax(logits, dim=1)
+        labels = probs.argmax(dim=1)
         return labels

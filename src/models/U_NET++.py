@@ -1,4 +1,4 @@
-"""Segformer model for cloud detection in Sentinel-2 imagery."""
+"""U-Net++ segmentation model for cloud detection in Sentinel-2 imagery."""
 
 from typing import Optional
 
@@ -7,30 +7,30 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 
 
-class CloudSegformer(nn.Module):
+class CloudUNetPlusPlus(nn.Module):
     """
-    Segformer model for multi-spectral segmentation.
+    U-Net++ segmentation model for cloud detection in Sentinel-2 images.
 
-    Designed for Sentinel-2 imagery with 13 bands and 4 output classes:
-    clear, thick cloud, thin cloud, and cloud shadow.
+    Supports multiple encoder backbones and can be configured for different
+    numbers of input bands and output classes.
 
     Attributes:
-        segformer: The underlying Segformer model from segmentation_models_pytorch.
+        unetplusplus: The underlying U-Net++ model from segmentation_models_pytorch.
     """
 
     def __init__(
         self,
-        encoder_name: str = "mit_b0",
-        encoder_weights: Optional[str] = "imagenet",
+        encoder_name: str = "resnet34",
+        encoder_weights: Optional[str] = None,
         in_channels: int = 13,
         num_classes: int = 4,
         freeze_encoder: bool = False,
     ):
         """
-        Initialize the Segformer model.
+        Initialize the U-Net++ model.
 
         Args:
-            encoder_name: Name of the Segformer backbone (e.g., 'mit_b0').
+            encoder_name: Name of the encoder backbone (e.g., 'resnet34').
             encoder_weights: Pretrained weights for encoder. Usually None
                 for multi-band inputs since pretrained weights expect 3 channels.
             in_channels: Number of input bands (default: 13 for Sentinel-2).
@@ -40,7 +40,7 @@ class CloudSegformer(nn.Module):
         """
         super().__init__()
 
-        self.segformer = smp.Segformer(
+        self.unetplusplus = smp.UnetPlusPlus(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
@@ -48,7 +48,7 @@ class CloudSegformer(nn.Module):
         )
 
         if freeze_encoder:
-            for param in self.segformer.encoder.parameters():
+            for param in self.unetplusplus.encoder.parameters():
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -61,7 +61,7 @@ class CloudSegformer(nn.Module):
         Returns:
             Output logits with shape (B, num_classes, H, W).
         """
-        return self.segformer(x)
+        return self.unetplusplus(x)
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:

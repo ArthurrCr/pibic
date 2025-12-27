@@ -107,7 +107,7 @@ class ModelEvaluator:
     
     
     def evaluate_model(self, model_name, models, test_loader, val_loader=None, 
-                  use_ensemble=None, normalize_imgs=None):
+                use_ensemble=None, normalize_imgs=None):
         """
         Avaliação completa de um modelo ou ensemble com cache automático
         """
@@ -117,13 +117,138 @@ class ModelEvaluator:
             print(f"\n{'='*60}")
             print(f"RESULTADOS JÁ EXISTEM PARA: {model_name}")
             print(f"{'='*60}")
-            print("✓ Usando resultados do cache")
+            
+            # Verificar o que está faltando
+            result = self.manager.results[model_name]
+            info = getattr(result, 'additional_info', {}) or {}
+            
+            missing = []
+            
+            # Verificar métricas essenciais
+            if not hasattr(result, 'confusion_matrix') or result.confusion_matrix.size == 0:
+                missing.append('confusion_matrix')
+            if not hasattr(result, 'metrics') or not result.metrics:
+                missing.append('metrics')
+            if not hasattr(result, 'boa_baseline') or not result.boa_baseline:
+                missing.append('boa_baseline')
+            if not hasattr(result, 'optimal_thresholds') or not result.optimal_thresholds:
+                missing.append('optimal_thresholds')
+            
+            # Verificar additional_info
+            if 'n_parameters' not in info:
+                missing.append('n_parameters')
+            if 'gflops' not in info:
+                missing.append('gflops')
+            if 'qualitative_examples' not in info:
+                missing.append('qualitative_examples')
+            if 'aggregated_metrics_by_category' not in info:
+                missing.append('aggregated_metrics')
+            if 'compute_cost' not in info:
+                missing.append('compute_cost')
+            
+            if missing:
+                print(f"⚠️  Métricas faltantes: {', '.join(missing)}")
+                print("Calculando métricas faltantes...")
+                
+                # Determinar configurações
+                if model_name in self.model_configs:
+                    config = self.model_configs[model_name]
+                    use_ensemble = config.get("use_ensemble", False) if use_ensemble is None else use_ensemble
+                    normalize_imgs = config.get("normalize_imgs", False) if normalize_imgs is None else normalize_imgs
+                else:
+                    use_ensemble = use_ensemble if use_ensemble is not None else False
+                    normalize_imgs = normalize_imgs if normalize_imgs is not None else False
+                
+                # Calcular apenas o que falta
+                if 'confusion_matrix' in missing or 'metrics' in missing:
+                    self._evaluate_confusion_matrix(model_name, models, test_loader, use_ensemble, normalize_imgs)
+                
+                if 'boa_baseline' in missing:
+                    self._evaluate_patches(model_name, models, test_loader, use_ensemble, normalize_imgs)
+                
+                if 'qualitative_examples' in missing:
+                    self._collect_qualitative_examples(model_name, models, test_loader, use_ensemble, normalize_imgs)
+                
+                if 'aggregated_metrics' in missing:
+                    self._compute_aggregated_metrics_by_category(model_name, models, test_loader, use_ensemble, normalize_imgs)
+                
+                if 'optimal_thresholds' in missing and val_loader is not None:
+                    self._calculate_optimal_thresholds(model_name, models, test_loader, use_ensemble, normalize_imgs, val_loader=val_loader)
+                elif 'optimal_thresholds' in missing:
+                    print("⚠️  val_loader necessário para calcular optimal_thresholds - pulando")
+                
+                if 'n_parameters' in missing or 'gflops' in missing:
+                    # Calcular parâmetros
+                    if 'n_parameters' in missing:
+                        n_params = sum(p.numel() for m in models for p in m.parameters())
+                        if not hasattr(result, 'additional_info') or result.additional_info is None:
+                            result.additional_info = {}
+                        result.additional_info['n_parameters'] = n_params
+                        print(f"✓ Parâmetros calculados: {n_params:,}")
+                    
+                    # Calcular GFLOPS
+                    if 'gflops' in missing:
+                        try:
+                            from thop import profile
+                            
+                            # Mover modelos para o device correto ANTES de calcular
+                            for m in models:
+                                m.to(self.device).eval()
+                            
+                            sample_input = torch.randn(1, test_loader.dataset[0][0].shape[0], 
+                                                    test_loader.dataset[0][0].shape[1], 
+                                                    test_loader.dataset[0][0].shape[2]).to(self.device)
+                            
+                            if use_ensemble:
+                                total_flops = 0
+                                for m in models:
+                                    flops, _ = profile(m, inputs=(sample_input,), verbose=False)
+                                    total_flops += flops
+                                gflops = total_flops / 1e9
+                            else:
+                                flops, _ = profile(models[0], inputs=(sample_input,), verbose=False)
+                                gflops = flops / 1e9
+                            
+                            # Mover modelos de volta para CPU para liberar memória GPU
+                            for m in models:
+                                m.to('cpu')
+                            
+                            if not hasattr(result, 'additional_info') or result.additional_info is None:
+                                result.additional_info = {}
+                            result.additional_info['gflops'] = gflops
+                            print(f"✓ GFLOPS calculado: {gflops:.2f}")
+                            
+                        except Exception as e:
+                            print(f"❌ Erro ao calcular GFLOPS: {e}")
+                            # Garantir que os modelos voltam para CPU mesmo em caso de erro
+                            for m in models:
+                                m.to('cpu')
+                
+                if 'compute_cost' in missing:
+                    self._benchmark_inference_costs(
+                        model_name, models, test_loader,
+                        use_ensemble=use_ensemble,
+                        normalize_imgs=normalize_imgs,
+                        warmup_batches=5,
+                        measure_batches=None,
+                        repetitions=5,
+                        min_patches=500,
+                        min_measured_ms=5000.0,
+                    )
+                
+                # Salvar tudo
+                self._save_complete_state(model_name)
+                print("✓ Cache atualizado com métricas faltantes")
+            else:
+                print("✓ Todas as métricas estão completas")
+            
             self._print_cached_summary(model_name)
             self._plot_all_results(model_name)
             return
         
+        # Se não existe no cache, fazer avaliação completa
         print(f"\n{'='*60}")
-        print(f"INICIANDO AVALIAÇÃO: {model_name}")
+        print(f"INICIANDO AVALIAÇÃO COMPLETA: {model_name}")
         print(f"{'='*60}")
         
         # Usar configuração específica do modelo se disponível
@@ -168,10 +293,35 @@ class ModelEvaluator:
 
         # Número de parâmetros (único caminho, funciona p/ 1 ou N modelos)
         n_params = sum(p.numel() for m in models for p in m.parameters())
+
+        # Calcular GFLOPS
+        try:
+            from thop import profile
+            # Usar shape do test_loader para calcular GFLOPS
+            sample_input = torch.randn(1, test_loader.dataset[0][0].shape[0], 
+                                    test_loader.dataset[0][0].shape[1], 
+                                    test_loader.dataset[0][0].shape[2]).to(self.device)
+            
+            if use_ensemble:
+                # Para ensemble, somar GFLOPS de todos os modelos
+                total_flops = 0
+                for m in models:
+                    flops, _ = profile(m, inputs=(sample_input,), verbose=False)
+                    total_flops += flops
+                gflops = total_flops / 1e9
+            else:
+                flops, _ = profile(models[0], inputs=(sample_input,), verbose=False)
+                gflops = flops / 1e9
+        except Exception as e:
+            print(f"Aviso: Não foi possível calcular GFLOPS: {e}")
+            gflops = None
+
         # Garante a existência de additional_info
         if not hasattr(self.manager.results[model_name], 'additional_info') or self.manager.results[model_name].additional_info is None:
             self.manager.results[model_name].additional_info = {}
         self.manager.results[model_name].additional_info['n_parameters'] = n_params
+        if gflops is not None:
+            self.manager.results[model_name].additional_info['gflops'] = gflops
 
         # Benchmark de custo computacional (usa as flags efetivas já resolvidas)
         self._benchmark_inference_costs(
@@ -1176,3 +1326,7 @@ class ModelEvaluator:
                 f"{sa['median']:.0f} / {sr['median']:.0f}  "
                 f"[allocated p95 {sa['p95']:.0f}; reserved p95 {sr['p95']:.0f}]")
         print("  Escopo: forward pass de GPU; paper reporta RAM do host e tempo por cena (E2E).")
+
+
+    
+    

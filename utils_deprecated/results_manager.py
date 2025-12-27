@@ -1465,3 +1465,187 @@ class ModelResultsManager:
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
+
+    
+    def plot_efficiency_bubble(self, models=None, figsize=(12, 8), save_path=None):
+        """
+        Gráfico de bolha comparando eficiência dos modelos.
+        
+        - Eixo X: Quantidade de parâmetros
+        - Eixo Y: IoU médio (média das 4 classes)
+        - Tamanho da bolha: GFLOPS
+        
+        Parameters
+        ----------
+        models : list[str], optional
+            Lista de modelos para comparar. Se None, usa todos.
+        figsize : tuple
+            Tamanho da figura.
+        save_path : str, optional
+            Caminho para salvar o PNG se desejado.
+        """
+        from matplotlib.patches import Patch
+        import numpy as np
+        import matplotlib.pyplot as plt
+        
+        if models is None:
+            models = sorted(self.results.keys())
+        
+        # Coletar dados
+        params_list = []
+        iou_list = []
+        gflops_list = []
+        used_models = []
+        
+        for m in models:
+            res = self.results.get(m)
+            if not res:
+                continue
+                
+            info = getattr(res, "additional_info", {}) or {}
+            
+            # Validar dados necessários
+            if 'n_parameters' not in info:
+                print(f"Aviso: {m} não possui 'n_parameters'. Pulando...")
+                continue
+            if 'gflops' not in info:
+                print(f"Aviso: {m} não possui 'gflops'. Pulando...")
+                continue
+            
+            # Calcular IoU médio das 4 classes
+            metrics = res.metrics
+            ious = []
+            for class_name in CLASS_NAMES:
+                if class_name in metrics and 'F1-Score' in metrics[class_name]:
+                    # Usar F1-Score como proxy se IoU não estiver disponível
+                    # ou buscar IoU diretamente se disponível
+                    if 'IoU' in metrics[class_name]:
+                        ious.append(metrics[class_name]['IoU'])
+                    else:
+                        # F1-Score é uma boa aproximação quando IoU não está disponível
+                        ious.append(metrics[class_name]['F1-Score'])
+            
+            if not ious:
+                print(f"Aviso: {m} não possui métricas de IoU/F1. Pulando...")
+                continue
+            
+            mean_iou = np.mean(ious)
+            
+            params_list.append(info['n_parameters'])
+            iou_list.append(mean_iou)
+            gflops_list.append(info['gflops'])
+            used_models.append(m)
+        
+        if not used_models:
+            raise ValueError("Nenhum modelo possui dados completos (n_parameters, gflops, métricas).")
+        
+        # Normalizar tamanho das bolhas (entre 100 e 2000 para boa visualização)
+        gflops_array = np.array(gflops_list)
+        min_gflops = gflops_array.min()
+        max_gflops = gflops_array.max()
+        
+        if max_gflops == min_gflops:
+            bubble_sizes = [500] * len(gflops_list)
+        else:
+            # Escala logarítmica para melhor diferenciação
+            bubble_sizes = 100 + 1900 * (np.log1p(gflops_array - min_gflops) / 
+                                        np.log1p(max_gflops - min_gflops))
+        
+        # Identificar melhor modelo (maior IoU médio)
+        best_idx = int(np.argmax(iou_list))
+        
+        # Criar figura
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot das bolhas
+        for i, m in enumerate(used_models):
+            color = self._get_color(m)
+            
+            # Scatter plot
+            scatter = ax.scatter(params_list[i], iou_list[i], 
+                               s=bubble_sizes[i], 
+                               c=[color], 
+                               alpha=0.6,
+                               edgecolors='black' if i == best_idx else 'gray',
+                               linewidths=2.5 if i == best_idx else 1,
+                               linestyle='--' if i == best_idx else '-')
+            
+            # Anotar com nome do modelo
+            ax.annotate(m, 
+                       (params_list[i], iou_list[i]),
+                       xytext=(5, 5), 
+                       textcoords='offset points',
+                       fontsize=8,
+                       bbox=dict(boxstyle='round,pad=0.3', 
+                               facecolor='white', 
+                               alpha=0.7,
+                               edgecolor=color))
+        
+        # Configurar eixos
+        ax.set_xlabel('Número de Parâmetros', fontsize=12)
+        ax.set_ylabel('IoU Médio', fontsize=12)
+        ax.set_title('Eficiência dos Modelos: IoU vs Parâmetros vs GFLOPS', 
+                    fontsize=14, fontweight='bold')
+        ax.grid(alpha=0.3)
+        
+        # Adicionar margem aos limites
+        x_range = max(params_list) - min(params_list)
+        y_range = max(iou_list) - min(iou_list)
+        ax.set_xlim(min(params_list) - 0.1*x_range, max(params_list) + 0.1*x_range)
+        ax.set_ylim(min(iou_list) - 0.05*y_range, max(iou_list) + 0.05*y_range)
+        
+        # Legenda de tamanhos
+        # Criar bolhas de referência para a legenda
+        legend_gflops = [min_gflops, (min_gflops + max_gflops)/2, max_gflops]
+        legend_sizes = []
+        for g in legend_gflops:
+            if max_gflops == min_gflops:
+                legend_sizes.append(500)
+            else:
+                s = 100 + 1900 * (np.log1p(g - min_gflops) / 
+                                 np.log1p(max_gflops - min_gflops))
+                legend_sizes.append(s)
+        
+        # Adicionar legenda de tamanhos no canto
+        legend_x = ax.get_xlim()[1] * 0.85
+        legend_y_base = ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.15
+        
+        for i, (gf, sz) in enumerate(zip(legend_gflops, legend_sizes)):
+            y_offset = i * 0.08 * (ax.get_ylim()[1] - ax.get_ylim()[0])
+            ax.scatter(legend_x, legend_y_base + y_offset, 
+                      s=sz, c='gray', alpha=0.4, edgecolors='black', linewidths=0.5)
+            ax.text(legend_x * 1.05, legend_y_base + y_offset, 
+                   f'{gf:.1f} GFLOPS', 
+                   fontsize=8, va='center')
+        
+        # Adicionar nota sobre o melhor modelo
+        best_model = used_models[best_idx]
+        note = (f"★ Melhor IoU: {best_model}\n"
+                f"   IoU={iou_list[best_idx]:.3f}, "
+                f"Params={params_list[best_idx]:,.0f}, "
+                f"GFLOPS={gflops_list[best_idx]:.1f}")
+        ax.text(0.02, 0.98, note, 
+               transform=ax.transAxes,
+               fontsize=9,
+               va='top',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # Imprimir tabela resumo
+        print("\n" + "="*80)
+        print("RESUMO DE EFICIÊNCIA DOS MODELOS")
+        print("="*80)
+        print(f"{'Modelo':<35} {'Parâmetros':>12} {'IoU Médio':>12} {'GFLOPS':>10}")
+        print("-"*80)
+        
+        # Ordenar por IoU (melhor primeiro)
+        sorted_indices = np.argsort(iou_list)[::-1]
+        for idx in sorted_indices:
+            marker = "★ " if idx == best_idx else "  "
+            print(f"{marker}{used_models[idx]:<33} {params_list[idx]:>12,.0f} "
+                  f"{iou_list[idx]:>12.4f} {gflops_list[idx]:>10.2f}")
+        print("="*80)
