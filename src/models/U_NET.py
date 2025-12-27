@@ -20,7 +20,7 @@ class CloudUNet(nn.Module):
 
     def __init__(
         self,
-        encoder_name: str = "mobilenet_v2",
+        encoder_name: str = "tu-regnetz_d8",
         encoder_weights: Optional[str] = None,
         in_channels: int = 13,
         num_classes: int = 4,
@@ -31,7 +31,6 @@ class CloudUNet(nn.Module):
 
         Args:
             encoder_name: Name of the encoder backbone. Examples:
-                - "mobilenet_v2": MobileNetV2 (lightweight)
                 - "tu-regnetz_d8": RegNetZ-D8 via timm
             encoder_weights: Pretrained weights for encoder. Usually None
                 for multi-band inputs since pretrained weights expect 3 channels.
