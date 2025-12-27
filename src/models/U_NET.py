@@ -7,7 +7,7 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 
 
-class CloudSegmentationModel(nn.Module):
+class CloudUNet(nn.Module):
     """
     U-Net segmentation model for cloud detection in Sentinel-2 images.
 
