@@ -115,6 +115,7 @@ def create_dataloaders(
     num_workers: int = 2,
     cache_enabled: bool = False,
     normalize: bool = False,
+    seed: int = 42,
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """
     Create train, validation, and test DataLoaders from dataset parts.
@@ -127,6 +128,7 @@ def create_dataloaders(
         num_workers: Number of worker processes for data loading.
         cache_enabled: If True, enables caching in datasets.
         normalize: If True, normalizes images.
+        seed: Random seed for reproducibility.
 
     Returns:
         Tuple of (train_loader, val_loader, test_loader). Any loader may be
@@ -170,12 +172,15 @@ def create_dataloaders(
         else None
     )
 
+    generator = torch.Generator().manual_seed(seed)
+
     train_loader = (
         DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
+            generator=generator,
         )
         if train_dataset
         else None

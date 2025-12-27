@@ -2,20 +2,32 @@
 
 import os
 import pickle
+import random
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 
 from utils.constants import CLASS_NAMES
 from utils.dataset import create_dataloaders
-from utils.losses import get_loss, LOSS_REGISTRY
+from utils.losses import get_loss
 from utils.metrics import compute_metrics, evaluate_model
 from utils.boa_metrics import evaluate_test_dataset
 from utils.training import train_model
+
+
+def set_seed(seed: int = 42) -> None:
+    """Set seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 @dataclass
@@ -36,6 +48,7 @@ class ExperimentConfig:
     loss_kwargs: Optional[Dict] = None
     scheduler_factor: float = 0.1
     scheduler_patience: int = 3
+    seed: int = 42
 
     def __post_init__(self):
         if self.loss_kwargs is None:
@@ -50,10 +63,12 @@ class ExperimentRunner:
         parts: List[str],
         base_dir: str = "/content/drive/MyDrive/pibic",
         device: str = "cuda",
+        seed: int = 42,
     ):
         self.parts = parts
         self.base_dir = base_dir
         self.device = device
+        self.seed = seed
         self.results: List[Dict] = []
 
         self.checkpoints_dir = os.path.join(base_dir, "checkpoints")
@@ -61,23 +76,23 @@ class ExperimentRunner:
         os.makedirs(self.checkpoints_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
 
-        # Cache dataloaders
         self._train_loader = None
         self._val_loader = None
         self._test_loader = None
+        self._current_batch_size = None
 
     def _get_dataloaders(self, batch_size: int):
         """Get or create dataloaders."""
-        if (
-            self._train_loader is None
-            or self._train_loader.batch_size != batch_size
-        ):
+        if self._train_loader is None or self._current_batch_size != batch_size:
             self._train_loader, self._val_loader, self._test_loader = create_dataloaders(
                 self.parts,
                 batch_size=batch_size,
                 normalize=True,
+                seed=self.seed,
             )
+            self._current_batch_size = batch_size
         return self._train_loader, self._val_loader, self._test_loader
+
     def print_setup(
         self,
         model_class: Type[nn.Module],
@@ -125,6 +140,7 @@ class ExperimentRunner:
         print(f"  Early stopping:  patience=10")
         print(f"  Optimizer:       Adam (weight_decay=1e-4)")
         print(f"  Scheduler:       ReduceLROnPlateau")
+        print(f"  Seed:            {self.seed}")
 
         print("\n[Hyperparameters to test]")
         print(f"  Learning rates:      {learning_rates}")
@@ -158,23 +174,25 @@ class ExperimentRunner:
     def run(self, config: ExperimentConfig, resume: bool = True) -> Dict:
         """Run a single experiment."""
 
+        # Set seed for reproducibility
+        set_seed(config.seed)
+
         print(f"\n{'='*60}")
         print(f"RUNNING: {config.name}")
         print(f"{'='*60}")
-        print(f"  Loss:             {config.loss_name}")
-        print(f"  LR:               {config.learning_rate}")
-        print(f"  Batch size:       {config.batch_size}")
-        print(f"  Scheduler factor: {config.scheduler_factor}")
+        print(f"  Loss:               {config.loss_name}")
+        print(f"  LR:                 {config.learning_rate}")
+        print(f"  Batch size:         {config.batch_size}")
+        print(f"  Scheduler factor:   {config.scheduler_factor}")
         print(f"  Scheduler patience: {config.scheduler_patience}")
+        print(f"  Seed:               {config.seed}")
         print("-" * 60)
 
         checkpoint_dir = os.path.join(self.checkpoints_dir, config.name)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # DataLoaders
         train_loader, val_loader, test_loader = self._get_dataloaders(config.batch_size)
 
-        # Model
         model = config.model_class(
             encoder_name=config.encoder_name,
             encoder_weights=config.encoder_weights,
@@ -183,23 +201,20 @@ class ExperimentRunner:
         )
 
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"  Parameters: {n_params:,}")
+        print(f"  Parameters:         {n_params:,}")
 
-        # Loss
         loss_fn = get_loss(config.loss_name, **config.loss_kwargs)
-        print(f"  Loss fn:    {loss_fn.__class__.__name__}")
+        print(f"  Loss fn:            {loss_fn.__class__.__name__}")
 
-        # Resume
         resume_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         if not resume or not os.path.isfile(resume_path):
             resume_path = None
-            print(f"  Resume:     Starting from scratch")
+            print(f"  Resume:             Starting from scratch")
         else:
-            print(f"  Resume:     From checkpoint")
+            print(f"  Resume:             From checkpoint")
 
         print("-" * 60)
 
-        # Train
         history = train_model(
             model=model,
             train_loader=train_loader,
@@ -217,13 +232,11 @@ class ExperimentRunner:
             scheduler_patience=config.scheduler_patience,
         )
 
-        # Load best model
         best_path = os.path.join(checkpoint_dir, "best_model.pth")
         checkpoint = torch.load(best_path, map_location=self.device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.to(self.device).eval()
 
-        # Evaluate
         print("\nEvaluating on test set...")
         df_boa = evaluate_test_dataset(
             test_loader, model, device=self.device, normalize_imgs=False
@@ -233,7 +246,6 @@ class ExperimentRunner:
         )
         metrics = compute_metrics(conf_matrix)
 
-        # Extract BOA values
         cloud_boa = float(
             df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0]
         )
@@ -251,6 +263,7 @@ class ExperimentRunner:
             "batch_size": config.batch_size,
             "sched_factor": config.scheduler_factor,
             "sched_patience": config.scheduler_patience,
+            "seed": config.seed,
             "cloud_boa": cloud_boa,
             "shadow_boa": shadow_boa,
             "valid_boa": valid_boa,
@@ -296,17 +309,21 @@ class ExperimentRunner:
             print(f"\n[{i}/{len(losses)}] Testing: {loss_name}")
 
             config = ExperimentConfig(
-                name=f"loss_{loss_name}",
+                name=f"stage1_loss_{loss_name}",
                 model_class=model_class,
                 loss_name=loss_name,
                 learning_rate=1e-4,
                 batch_size=4,
+                scheduler_factor=0.1,
+                scheduler_patience=3,
+                seed=self.seed,
             )
             self.run(config, resume=True)
 
         print("\n" + "#" * 60)
         print("STAGE 1 COMPLETE")
         print("#" * 60)
+        self.print_summary()
 
         return self.get_summary()
 
@@ -317,7 +334,7 @@ class ExperimentRunner:
         learning_rates: List[float] = None,
         batch_sizes: List[int] = None,
     ) -> pd.DataFrame:
-        """Stage 2: Tune hyperparameters with best loss."""
+        """Stage 2: Tune LR and batch size with best loss."""
 
         if learning_rates is None:
             learning_rates = [5e-4, 1e-4, 5e-5]
@@ -344,20 +361,24 @@ class ExperimentRunner:
                 print(f"\n[{current}/{total}] Testing: lr={lr}, batch_size={bs}")
 
                 config = ExperimentConfig(
-                    name=f"hp_{best_loss}_lr{lr}_bs{bs}",
+                    name=f"stage2_hp_lr{lr}_bs{bs}",
                     model_class=model_class,
                     loss_name=best_loss,
                     learning_rate=lr,
                     batch_size=bs,
+                    scheduler_factor=0.1,
+                    scheduler_patience=3,
+                    seed=self.seed,
                 )
                 self.run(config, resume=True)
 
         print("\n" + "#" * 60)
         print("STAGE 2 COMPLETE")
         print("#" * 60)
+        self.print_summary()
 
         return self.get_summary()
-    
+
     def run_scheduler_tuning(
         self,
         model_class: Type[nn.Module],
@@ -379,6 +400,7 @@ class ExperimentRunner:
         print(f"  Loss: {best_loss}, LR: {best_lr}, BS: {best_batch_size}")
         print(f"  Factors:   {factors}")
         print(f"  Patiences: {patiences}")
+        print(f"  Seed:      {self.seed}")
         print("#" * 60)
 
         total = len(factors) * len(patiences)
@@ -397,12 +419,46 @@ class ExperimentRunner:
                     batch_size=best_batch_size,
                     scheduler_factor=factor,
                     scheduler_patience=sched_patience,
+                    seed=self.seed,
                 )
                 self.run(config, resume=True)
 
         print("\n" + "#" * 60)
         print("STAGE 3 COMPLETE")
         print("#" * 60)
+        self.print_summary()
+
+        return self.get_summary()
+
+    def run_full_pipeline(
+        self,
+        model_class: Type[nn.Module],
+    ) -> pd.DataFrame:
+        """Run complete optimization pipeline (all 3 stages)."""
+
+        print("\n" + "=" * 60)
+        print("FULL OPTIMIZATION PIPELINE")
+        print(f"Seed: {self.seed}")
+        print("=" * 60)
+
+        # Stage 1
+        self.run_loss_comparison(model_class)
+        best_loss = self.get_summary().iloc[0]["loss"]
+        print(f"\n>>> Best loss: {best_loss}")
+
+        # Stage 2
+        self.run_hyperparameter_tuning(model_class, best_loss)
+        best_row = self.get_summary().iloc[0]
+        best_lr = best_row["lr"]
+        best_bs = int(best_row["batch_size"])
+        print(f"\n>>> Best LR: {best_lr}, Best BS: {best_bs}")
+
+        # Stage 3
+        self.run_scheduler_tuning(model_class, best_loss, best_lr, best_bs)
+
+        print("\n" + "=" * 60)
+        print("PIPELINE COMPLETE")
+        print("=" * 60)
         self.print_summary()
 
         return self.get_summary()
@@ -422,26 +478,30 @@ class ExperimentRunner:
             print("No results yet.")
             return
 
-        print("\n" + "=" * 80)
+        print("\n" + "=" * 100)
         print("EXPERIMENT RESULTS (sorted by Cloud BOA)")
-        print("=" * 80)
+        print("=" * 100)
 
-        cols = ["name", "loss", "lr", "batch_size", "cloud_boa", "shadow_boa", "valid_boa", "accuracy", "best_epoch"]
-        print(df[cols].to_string(index=False))
+        cols = [
+            "name", "loss", "lr", "batch_size", "sched_factor", "sched_patience",
+            "cloud_boa", "shadow_boa", "valid_boa", "accuracy", "best_epoch", "seed"
+        ]
+        available_cols = [c for c in cols if c in df.columns]
+        print(df[available_cols].to_string(index=False))
 
-        print("\n" + "-" * 80)
+        print("\n" + "-" * 100)
         best = df.iloc[0]
         print(f"BEST: {best['name']}")
         print(f"  Loss: {best['loss']}, LR: {best['lr']}, BS: {best['batch_size']}")
-        print(f"  Cloud BOA: {best['cloud_boa']:.4f}, Accuracy: {best['accuracy']:.4f}")
-        print("=" * 80 + "\n")
+        print(f"  Scheduler: factor={best.get('sched_factor', 'N/A')}, patience={best.get('sched_patience', 'N/A')}")
+        print(f"  Cloud BOA: {best['cloud_boa']:.4f}, Shadow BOA: {best['shadow_boa']:.4f}, Accuracy: {best['accuracy']:.4f}")
+        print(f"  Seed: {best.get('seed', 'N/A')}")
+        print("=" * 100 + "\n")
 
     def _save_results(self) -> None:
         """Save results to disk."""
         df = self.get_summary()
-        df.to_csv(
-            os.path.join(self.results_dir, "experiments_summary.csv"), index=False
-        )
+        df.to_csv(os.path.join(self.results_dir, "experiments_summary.csv"), index=False)
 
         with open(os.path.join(self.results_dir, "experiments_full.pkl"), "wb") as f:
             pickle.dump(self.results, f)
