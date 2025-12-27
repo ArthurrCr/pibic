@@ -43,7 +43,7 @@ class ExperimentConfig:
     batch_size: int = 4
     learning_rate: float = 1e-4
     num_epochs: int = 50
-    patience: int = 10
+    patience: int = 3
     loss_name: str = "ce"
     loss_kwargs: Optional[Dict] = None
     scheduler_factor: float = 0.1
