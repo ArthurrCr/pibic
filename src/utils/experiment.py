@@ -137,7 +137,7 @@ class ExperimentRunner:
         print("\n[Training]")
         print(f"  Device:          {self.device}")
         print(f"  Epochs:          50")
-        print(f"  Early stopping:  patience=10")
+        print(f"  Early stopping:  patience=3")
         print(f"  Optimizer:       Adam (weight_decay=1e-4)")
         print(f"  Scheduler:       ReduceLROnPlateau")
         print(f"  Seed:            {self.seed}")
