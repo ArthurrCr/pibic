@@ -33,7 +33,9 @@ class ExperimentConfig:
     num_epochs: int = 50
     patience: int = 10
     loss_name: str = "ce"
-    loss_kwargs: Dict = None
+    loss_kwargs: Optional[Dict] = None
+    scheduler_factor: float = 0.1
+    scheduler_patience: int = 3
 
     def __post_init__(self):
         if self.loss_kwargs is None:
@@ -76,30 +78,34 @@ class ExperimentRunner:
                 normalize=True,
             )
         return self._train_loader, self._val_loader, self._test_loader
-
     def print_setup(
         self,
         model_class: Type[nn.Module],
         losses: List[str] = None,
         learning_rates: List[float] = None,
         batch_sizes: List[int] = None,
+        scheduler_factors: List[float] = None,
+        scheduler_patiences: List[int] = None,
     ) -> None:
         """Print experiment setup information."""
-        
+
         if losses is None:
             losses = ["ce", "dice_ce", "focal", "focal_tversky", "dice_focal"]
         if learning_rates is None:
             learning_rates = [1e-4]
         if batch_sizes is None:
             batch_sizes = [4]
+        if scheduler_factors is None:
+            scheduler_factors = [0.1]
+        if scheduler_patiences is None:
+            scheduler_patiences = [3]
 
-        # Get sample dataloaders for counts
         train_loader, val_loader, test_loader = self._get_dataloaders(batch_sizes[0])
 
         print("\n" + "=" * 60)
         print("EXPERIMENT SETUP")
         print("=" * 60)
-        
+
         print("\n[Model]")
         print(f"  Class:           {model_class.__name__}")
         print(f"  Encoder:         tu-regnetz_d8")
@@ -116,13 +122,15 @@ class ExperimentRunner:
         print("\n[Training]")
         print(f"  Device:          {self.device}")
         print(f"  Epochs:          50")
-        print(f"  Patience:        10")
-        print(f"  Optimizer:       Adam")
+        print(f"  Early stopping:  patience=10")
+        print(f"  Optimizer:       Adam (weight_decay=1e-4)")
         print(f"  Scheduler:       ReduceLROnPlateau")
 
         print("\n[Hyperparameters to test]")
-        print(f"  Learning rates:  {learning_rates}")
-        print(f"  Batch sizes:     {batch_sizes}")
+        print(f"  Learning rates:      {learning_rates}")
+        print(f"  Batch sizes:         {batch_sizes}")
+        print(f"  Scheduler factors:   {scheduler_factors}")
+        print(f"  Scheduler patiences: {scheduler_patiences}")
 
         print("\n[Losses to test]")
         loss_descriptions = {
@@ -142,9 +150,9 @@ class ExperimentRunner:
         print(f"  Checkpoints:     {self.checkpoints_dir}")
         print(f"  Results:         {self.results_dir}")
 
-        total_experiments = len(losses) * len(learning_rates) * len(batch_sizes)
+        total = len(losses) * len(learning_rates) * len(batch_sizes)
         print("\n" + "-" * 60)
-        print(f"Total experiments: {total_experiments}")
+        print(f"Total experiments: {total}")
         print("=" * 60 + "\n")
 
     def run(self, config: ExperimentConfig, resume: bool = True) -> Dict:
@@ -153,9 +161,11 @@ class ExperimentRunner:
         print(f"\n{'='*60}")
         print(f"RUNNING: {config.name}")
         print(f"{'='*60}")
-        print(f"  Loss:       {config.loss_name}")
-        print(f"  LR:         {config.learning_rate}")
-        print(f"  Batch size: {config.batch_size}")
+        print(f"  Loss:             {config.loss_name}")
+        print(f"  LR:               {config.learning_rate}")
+        print(f"  Batch size:       {config.batch_size}")
+        print(f"  Scheduler factor: {config.scheduler_factor}")
+        print(f"  Scheduler patience: {config.scheduler_patience}")
         print("-" * 60)
 
         checkpoint_dir = os.path.join(self.checkpoints_dir, config.name)
@@ -203,6 +213,8 @@ class ExperimentRunner:
             mode="min",
             patience=config.patience,
             loss_fn=loss_fn,
+            scheduler_factor=config.scheduler_factor,
+            scheduler_patience=config.scheduler_patience,
         )
 
         # Load best model
@@ -237,6 +249,8 @@ class ExperimentRunner:
             "loss": config.loss_name,
             "lr": config.learning_rate,
             "batch_size": config.batch_size,
+            "sched_factor": config.scheduler_factor,
+            "sched_patience": config.scheduler_patience,
             "cloud_boa": cloud_boa,
             "shadow_boa": shadow_boa,
             "valid_boa": valid_boa,
@@ -341,6 +355,55 @@ class ExperimentRunner:
         print("\n" + "#" * 60)
         print("STAGE 2 COMPLETE")
         print("#" * 60)
+
+        return self.get_summary()
+    
+    def run_scheduler_tuning(
+        self,
+        model_class: Type[nn.Module],
+        best_loss: str,
+        best_lr: float,
+        best_batch_size: int,
+        factors: List[float] = None,
+        patiences: List[int] = None,
+    ) -> pd.DataFrame:
+        """Stage 3: Tune ReduceLROnPlateau hyperparameters."""
+
+        if factors is None:
+            factors = [0.1, 0.5]
+        if patiences is None:
+            patiences = [2, 3, 5]
+
+        print("\n" + "#" * 60)
+        print("STAGE 3: SCHEDULER TUNING (ReduceLROnPlateau)")
+        print(f"  Loss: {best_loss}, LR: {best_lr}, BS: {best_batch_size}")
+        print(f"  Factors:   {factors}")
+        print(f"  Patiences: {patiences}")
+        print("#" * 60)
+
+        total = len(factors) * len(patiences)
+        current = 0
+
+        for factor in factors:
+            for sched_patience in patiences:
+                current += 1
+                print(f"\n[{current}/{total}] Testing: factor={factor}, patience={sched_patience}")
+
+                config = ExperimentConfig(
+                    name=f"stage3_sched_f{factor}_p{sched_patience}",
+                    model_class=model_class,
+                    loss_name=best_loss,
+                    learning_rate=best_lr,
+                    batch_size=best_batch_size,
+                    scheduler_factor=factor,
+                    scheduler_patience=sched_patience,
+                )
+                self.run(config, resume=True)
+
+        print("\n" + "#" * 60)
+        print("STAGE 3 COMPLETE")
+        print("#" * 60)
+        self.print_summary()
 
         return self.get_summary()
 

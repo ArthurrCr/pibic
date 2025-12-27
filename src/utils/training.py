@@ -94,7 +94,9 @@ def train_model(
     patience: int = 3,
     min_delta: float = 1e-4,
     use_early_stopping: bool = True,
-    loss_fn: Optional[nn.Module] = None
+    loss_fn: Optional[nn.Module] = None,
+    scheduler_factor: float = 0.1,
+    scheduler_patience: int = 3
 ) -> Dict[str, list]:
     """
     Train a multiclass segmentation model.
@@ -128,10 +130,13 @@ def train_model(
         criterion = loss_fn.to(device)
     else:
         criterion = nn.CrossEntropyLoss()
-        
+
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
-        optimizer, mode=mode, factor=0.1, patience=3, verbose=True
+        optimizer,
+        mode=mode,
+        factor=scheduler_factor,
+        patience=scheduler_patience,
     )
     scaler = torch.amp.GradScaler()
 
