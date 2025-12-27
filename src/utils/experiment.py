@@ -2,7 +2,7 @@
 
 import os
 import pickle
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type
 
@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from utils.constants import CLASS_NAMES
 from utils.dataset import create_dataloaders
-from utils.losses import get_loss
+from utils.losses import get_loss, LOSS_REGISTRY
 from utils.metrics import compute_metrics, evaluate_model
 from utils.boa_metrics import evaluate_test_dataset
 from utils.training import train_model
@@ -21,7 +21,7 @@ from utils.training import train_model
 @dataclass
 class ExperimentConfig:
     """Configuration for a single experiment."""
-    
+
     name: str
     model_class: Type[nn.Module]
     encoder_name: str = "tu-regnetz_d8"
@@ -34,7 +34,7 @@ class ExperimentConfig:
     patience: int = 10
     loss_name: str = "ce"
     loss_kwargs: Dict = None
-    
+
     def __post_init__(self):
         if self.loss_kwargs is None:
             self.loss_kwargs = {}
@@ -59,23 +59,110 @@ class ExperimentRunner:
         os.makedirs(self.checkpoints_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
 
+        # Cache dataloaders
+        self._train_loader = None
+        self._val_loader = None
+        self._test_loader = None
+
+    def _get_dataloaders(self, batch_size: int):
+        """Get or create dataloaders."""
+        if (
+            self._train_loader is None
+            or self._train_loader.batch_size != batch_size
+        ):
+            self._train_loader, self._val_loader, self._test_loader = create_dataloaders(
+                self.parts,
+                batch_size=batch_size,
+                normalize=True,
+            )
+        return self._train_loader, self._val_loader, self._test_loader
+
+    def print_setup(
+        self,
+        model_class: Type[nn.Module],
+        losses: List[str] = None,
+        learning_rates: List[float] = None,
+        batch_sizes: List[int] = None,
+    ) -> None:
+        """Print experiment setup information."""
+        
+        if losses is None:
+            losses = ["ce", "dice_ce", "focal", "focal_tversky", "dice_focal"]
+        if learning_rates is None:
+            learning_rates = [1e-4]
+        if batch_sizes is None:
+            batch_sizes = [4]
+
+        # Get sample dataloaders for counts
+        train_loader, val_loader, test_loader = self._get_dataloaders(batch_sizes[0])
+
+        print("\n" + "=" * 60)
+        print("EXPERIMENT SETUP")
+        print("=" * 60)
+        
+        print("\n[Model]")
+        print(f"  Class:           {model_class.__name__}")
+        print(f"  Encoder:         tu-regnetz_d8")
+        print(f"  Encoder weights: None (13 bands)")
+        print(f"  Input channels:  13")
+        print(f"  Num classes:     4 (Clear, Thick Cloud, Thin Cloud, Shadow)")
+
+        print("\n[Dataset]")
+        print(f"  Train samples:   {len(train_loader.dataset)}")
+        print(f"  Val samples:     {len(val_loader.dataset)}")
+        print(f"  Test samples:    {len(test_loader.dataset)}")
+        print(f"  Normalization:   /10000")
+
+        print("\n[Training]")
+        print(f"  Device:          {self.device}")
+        print(f"  Epochs:          50")
+        print(f"  Patience:        10")
+        print(f"  Optimizer:       Adam")
+        print(f"  Scheduler:       ReduceLROnPlateau")
+
+        print("\n[Hyperparameters to test]")
+        print(f"  Learning rates:  {learning_rates}")
+        print(f"  Batch sizes:     {batch_sizes}")
+
+        print("\n[Losses to test]")
+        loss_descriptions = {
+            "ce": "CrossEntropy (baseline)",
+            "dice": "Dice Loss",
+            "focal": "Focal Loss (gamma=2.0, alpha=0.25)",
+            "tversky": "Tversky Loss (alpha=0.3, beta=0.7)",
+            "focal_tversky": "Focal Tversky (alpha=0.3, beta=0.7, gamma=0.75)",
+            "dice_ce": "Dice + CE (0.5/0.5)",
+            "dice_focal": "Dice + Focal (0.5/0.5)",
+        }
+        for i, loss in enumerate(losses, 1):
+            desc = loss_descriptions.get(loss, loss)
+            print(f"  {i}. {loss:15} -> {desc}")
+
+        print("\n[Output]")
+        print(f"  Checkpoints:     {self.checkpoints_dir}")
+        print(f"  Results:         {self.results_dir}")
+
+        total_experiments = len(losses) * len(learning_rates) * len(batch_sizes)
+        print("\n" + "-" * 60)
+        print(f"Total experiments: {total_experiments}")
+        print("=" * 60 + "\n")
+
     def run(self, config: ExperimentConfig, resume: bool = True) -> Dict:
         """Run a single experiment."""
-        
+
         print(f"\n{'='*60}")
-        print(f"Experiment: {config.name}")
-        print(f"Loss: {config.loss_name} | LR: {config.learning_rate} | BS: {config.batch_size}")
+        print(f"RUNNING: {config.name}")
         print(f"{'='*60}")
+        print(f"  Loss:       {config.loss_name}")
+        print(f"  LR:         {config.learning_rate}")
+        print(f"  Batch size: {config.batch_size}")
+        print("-" * 60)
 
         checkpoint_dir = os.path.join(self.checkpoints_dir, config.name)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # DataLoaders
-        train_loader, val_loader, test_loader = create_dataloaders(
-            self.parts,
-            batch_size=config.batch_size,
-            normalize=True,
-        )
+        train_loader, val_loader, test_loader = self._get_dataloaders(config.batch_size)
 
         # Model
         model = config.model_class(
@@ -86,16 +173,21 @@ class ExperimentRunner:
         )
 
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"Parameters: {n_params:,}")
+        print(f"  Parameters: {n_params:,}")
 
         # Loss
         loss_fn = get_loss(config.loss_name, **config.loss_kwargs)
-        print(f"Loss function: {loss_fn.__class__.__name__}")
+        print(f"  Loss fn:    {loss_fn.__class__.__name__}")
 
         # Resume
         resume_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         if not resume or not os.path.isfile(resume_path):
             resume_path = None
+            print(f"  Resume:     Starting from scratch")
+        else:
+            print(f"  Resume:     From checkpoint")
+
+        print("-" * 60)
 
         # Train
         history = train_model(
@@ -120,14 +212,25 @@ class ExperimentRunner:
         model.to(self.device).eval()
 
         # Evaluate
-        df_boa = evaluate_test_dataset(test_loader, model, device=self.device, normalize_imgs=False)
-        conf_matrix = evaluate_model(test_loader, model, device=self.device, normalize_imgs=False)
+        print("\nEvaluating on test set...")
+        df_boa = evaluate_test_dataset(
+            test_loader, model, device=self.device, normalize_imgs=False
+        )
+        conf_matrix = evaluate_model(
+            test_loader, model, device=self.device, normalize_imgs=False
+        )
         metrics = compute_metrics(conf_matrix)
 
         # Extract BOA values
-        cloud_boa = float(df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0])
-        shadow_boa = float(df_boa[df_boa["Experiment"] == "cloud shadow"]["Median BOA"].values[0])
-        valid_boa = float(df_boa[df_boa["Experiment"] == "valid/invalid"]["Median BOA"].values[0])
+        cloud_boa = float(
+            df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0]
+        )
+        shadow_boa = float(
+            df_boa[df_boa["Experiment"] == "cloud shadow"]["Median BOA"].values[0]
+        )
+        valid_boa = float(
+            df_boa[df_boa["Experiment"] == "valid/invalid"]["Median BOA"].values[0]
+        )
 
         result = {
             "name": config.name,
@@ -139,6 +242,7 @@ class ExperimentRunner:
             "valid_boa": valid_boa,
             "accuracy": metrics["Overall"]["Accuracy"],
             "best_epoch": checkpoint.get("best_epoch", -1),
+            "best_val_loss": checkpoint.get("best_metric", -1),
             "n_params": n_params,
             "timestamp": datetime.now().isoformat(),
         }
@@ -146,52 +250,98 @@ class ExperimentRunner:
         self.results.append(result)
         self._save_results()
 
-        print(f"\nResults:")
-        print(f"  Cloud BOA:  {cloud_boa:.4f}")
-        print(f"  Shadow BOA: {shadow_boa:.4f}")
-        print(f"  Valid BOA:  {valid_boa:.4f}")
-        print(f"  Accuracy:   {metrics['Overall']['Accuracy']:.4f}")
+        print(f"\n{'='*60}")
+        print(f"RESULTS: {config.name}")
+        print(f"{'='*60}")
+        print(f"  Cloud BOA:     {cloud_boa:.4f}")
+        print(f"  Shadow BOA:    {shadow_boa:.4f}")
+        print(f"  Valid BOA:     {valid_boa:.4f}")
+        print(f"  Accuracy:      {metrics['Overall']['Accuracy']:.4f}")
+        print(f"  Best epoch:    {result['best_epoch']}")
+        print(f"{'='*60}\n")
 
         return result
 
-    def run_loss_comparison(self, model_class: Type[nn.Module]) -> pd.DataFrame:
-        """Etapa 1: Compare loss functions with fixed hyperparameters."""
-        
-        losses = ["ce", "dice_ce", "focal", "focal_tversky", "dice_focal"]
-        
-        for loss_name in losses:
+    def run_loss_comparison(
+        self,
+        model_class: Type[nn.Module],
+        losses: List[str] = None,
+    ) -> pd.DataFrame:
+        """Stage 1: Compare loss functions with fixed hyperparameters."""
+
+        if losses is None:
+            losses = ["ce", "dice_ce", "focal", "focal_tversky", "dice_focal"]
+
+        self.print_setup(model_class, losses=losses)
+
+        print("\n" + "#" * 60)
+        print("STAGE 1: LOSS FUNCTION COMPARISON")
+        print("#" * 60)
+
+        for i, loss_name in enumerate(losses, 1):
+            print(f"\n[{i}/{len(losses)}] Testing: {loss_name}")
+
             config = ExperimentConfig(
-                name=f"loss_comparison_{loss_name}",
+                name=f"loss_{loss_name}",
                 model_class=model_class,
                 loss_name=loss_name,
                 learning_rate=1e-4,
                 batch_size=4,
             )
             self.run(config, resume=True)
-        
+
+        print("\n" + "#" * 60)
+        print("STAGE 1 COMPLETE")
+        print("#" * 60)
+
         return self.get_summary()
 
     def run_hyperparameter_tuning(
         self,
         model_class: Type[nn.Module],
         best_loss: str,
+        learning_rates: List[float] = None,
+        batch_sizes: List[int] = None,
     ) -> pd.DataFrame:
-        """Etapa 2: Tune hyperparameters with best loss."""
-        
-        learning_rates = [5e-4, 1e-4, 5e-5]
-        batch_sizes = [4, 8]
-        
+        """Stage 2: Tune hyperparameters with best loss."""
+
+        if learning_rates is None:
+            learning_rates = [5e-4, 1e-4, 5e-5]
+        if batch_sizes is None:
+            batch_sizes = [4, 8]
+
+        self.print_setup(
+            model_class,
+            losses=[best_loss],
+            learning_rates=learning_rates,
+            batch_sizes=batch_sizes,
+        )
+
+        print("\n" + "#" * 60)
+        print(f"STAGE 2: HYPERPARAMETER TUNING (loss={best_loss})")
+        print("#" * 60)
+
+        total = len(learning_rates) * len(batch_sizes)
+        current = 0
+
         for lr in learning_rates:
             for bs in batch_sizes:
+                current += 1
+                print(f"\n[{current}/{total}] Testing: lr={lr}, batch_size={bs}")
+
                 config = ExperimentConfig(
-                    name=f"hp_tuning_{best_loss}_lr{lr}_bs{bs}",
+                    name=f"hp_{best_loss}_lr{lr}_bs{bs}",
                     model_class=model_class,
                     loss_name=best_loss,
                     learning_rate=lr,
                     batch_size=bs,
                 )
                 self.run(config, resume=True)
-        
+
+        print("\n" + "#" * 60)
+        print("STAGE 2 COMPLETE")
+        print("#" * 60)
+
         return self.get_summary()
 
     def get_summary(self) -> pd.DataFrame:
@@ -201,10 +351,34 @@ class ExperimentRunner:
             df = df.sort_values("cloud_boa", ascending=False)
         return df
 
+    def print_summary(self) -> None:
+        """Print formatted summary of results."""
+        df = self.get_summary()
+
+        if df.empty:
+            print("No results yet.")
+            return
+
+        print("\n" + "=" * 80)
+        print("EXPERIMENT RESULTS (sorted by Cloud BOA)")
+        print("=" * 80)
+
+        cols = ["name", "loss", "lr", "batch_size", "cloud_boa", "shadow_boa", "valid_boa", "accuracy", "best_epoch"]
+        print(df[cols].to_string(index=False))
+
+        print("\n" + "-" * 80)
+        best = df.iloc[0]
+        print(f"BEST: {best['name']}")
+        print(f"  Loss: {best['loss']}, LR: {best['lr']}, BS: {best['batch_size']}")
+        print(f"  Cloud BOA: {best['cloud_boa']:.4f}, Accuracy: {best['accuracy']:.4f}")
+        print("=" * 80 + "\n")
+
     def _save_results(self) -> None:
         """Save results to disk."""
         df = self.get_summary()
-        df.to_csv(os.path.join(self.results_dir, "experiments_summary.csv"), index=False)
-        
+        df.to_csv(
+            os.path.join(self.results_dir, "experiments_summary.csv"), index=False
+        )
+
         with open(os.path.join(self.results_dir, "experiments_full.pkl"), "wb") as f:
             pickle.dump(self.results, f)
