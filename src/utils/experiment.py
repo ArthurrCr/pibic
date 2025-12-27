@@ -339,7 +339,7 @@ class ExperimentRunner:
         if learning_rates is None:
             learning_rates = [5e-4, 1e-4, 5e-5]
         if batch_sizes is None:
-            batch_sizes = [4, 8]
+            batch_sizes = [4]
 
         self.print_setup(
             model_class,
