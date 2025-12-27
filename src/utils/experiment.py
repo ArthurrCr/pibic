@@ -43,7 +43,7 @@ class ExperimentConfig:
     batch_size: int = 4
     learning_rate: float = 1e-4
     num_epochs: int = 50
-    patience: int = 3
+    patience: int = 5
     loss_name: str = "ce"
     loss_kwargs: Optional[Dict] = None
     scheduler_factor: float = 0.1
@@ -137,7 +137,7 @@ class ExperimentRunner:
         print("\n[Training]")
         print(f"  Device:          {self.device}")
         print(f"  Epochs:          50")
-        print(f"  Early stopping:  patience=3")
+        print(f"  Early stopping:  patience=5")
         print(f"  Optimizer:       Adam (weight_decay=1e-4)")
         print(f"  Scheduler:       ReduceLROnPlateau")
         print(f"  Seed:            {self.seed}")
