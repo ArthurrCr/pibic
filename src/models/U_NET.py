@@ -1,4 +1,11 @@
-"""U-Net segmentation models for cloud detection in Sentinel-2 imagery."""
+"""U-Net segmentation models for cloud detection in Sentinel-2 imagery.
+
+
+ImageNet pretrained weights were used for encoder initialization. 
+For the 13-band input, the first convolutional layer weights were replicated 
+cyclically across channels and rescaled following the segmentation-models-pytorch 
+default behavior.
+"""
 
 from typing import Optional
 
@@ -21,7 +28,7 @@ class CloudUNet(nn.Module):
     def __init__(
         self,
         encoder_name: str = "tu-regnetz_d8",
-        encoder_weights: Optional[str] = None,
+        encoder_weights: Optional[str] = "imagenet",
         in_channels: int = 13,
         num_classes: int = 4,
         freeze_encoder: bool = False,

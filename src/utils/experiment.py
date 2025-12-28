@@ -37,7 +37,7 @@ class ExperimentConfig:
     name: str
     model_class: Type[nn.Module]
     encoder_name: str = "tu-regnetz_d8"
-    encoder_weights: Optional[str] = None
+    encoder_weights: Optional[str] = "imagenet"
     in_channels: int = 13
     num_classes: int = 4
     batch_size: int = 4
