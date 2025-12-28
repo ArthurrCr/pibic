@@ -124,7 +124,7 @@ class ExperimentRunner:
         print("\n[Model]")
         print(f"  Class:           {model_class.__name__}")
         print(f"  Encoder:         tu-regnetz_d8")
-        print(f"  Encoder weights: imagenet (13 bands)")
+        print(f"  Encoder weights: imagenet (3 bands RGB)")
         print(f"  Input channels:  13")
         print(f"  Num classes:     4 (Clear, Thick Cloud, Thin Cloud, Shadow)")
 
