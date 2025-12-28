@@ -16,24 +16,11 @@ from utils.constants import NUM_CLASSES
 
 
 class EarlyStopping:
-    """
-    Early stopping callback for training.
-
-    Monitors a metric and stops training if no improvement is seen
-    for a specified number of epochs.
-
-    Attributes:
-        patience: Number of epochs to wait for improvement.
-        mode: "max" if higher is better, "min" if lower is better.
-        min_delta: Minimum change to qualify as an improvement.
-        counter: Current count of epochs without improvement.
-        best_metric: Best metric value seen so far.
-        early_stop: Flag indicating whether to stop training.
-    """
+    """Early stopping callback for training."""
 
     def __init__(
         self,
-        patience: int = 3,
+        patience: int = 5,
         mode: str = "max",
         min_delta: float = 1e-4,
     ):
@@ -42,9 +29,8 @@ class EarlyStopping:
 
         Args:
             patience: Number of epochs to wait before stopping.
-            mode: "max" for metrics where higher is better (e.g., accuracy),
-                "min" for metrics where lower is better (e.g., loss).
-            min_delta: Minimum change to count as improvement.
+            mode: "max" if higher metric is better, "min" otherwise.
+            min_delta: Minimum change to qualify as improvement.
         """
         self.patience = patience
         self.mode = mode
@@ -54,12 +40,6 @@ class EarlyStopping:
         self.early_stop = False
 
     def __call__(self, current_metric: float) -> None:
-        """
-        Check if training should stop.
-
-        Args:
-            current_metric: Current value of the monitored metric.
-        """
         if self.best_metric is None:
             self.best_metric = current_metric
             return
@@ -78,12 +58,26 @@ class EarlyStopping:
         if self.counter >= self.patience:
             self.early_stop = True
 
+    def state_dict(self) -> Dict:
+        """Return state for checkpointing."""
+        return {
+            "counter": self.counter,
+            "best_metric": self.best_metric,
+            "early_stop": self.early_stop,
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        """Load state from checkpoint."""
+        self.counter = state.get("counter", 0)
+        self.best_metric = state.get("best_metric", None)
+        self.early_stop = state.get("early_stop", False)
+
 
 def train_model(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
     val_loader: torch.utils.data.DataLoader,
-    num_epochs: int = 10,
+    num_epochs: int = 50,
     lr: float = 1e-4,
     device: str = "cuda",
     checkpoint_dir: Optional[str] = None,
@@ -91,12 +85,12 @@ def train_model(
     save_best: bool = True,
     metric_to_monitor: str = "val_loss",
     mode: str = "min",
-    patience: int = 3,
+    patience: int = 5,
     min_delta: float = 1e-4,
     use_early_stopping: bool = True,
     loss_fn: Optional[nn.Module] = None,
     scheduler_factor: float = 0.1,
-    scheduler_patience: int = 3
+    scheduler_patience: int = 3,
 ) -> Dict[str, list]:
     """
     Train a multiclass segmentation model.
@@ -106,38 +100,46 @@ def train_model(
         train_loader: DataLoader for training data.
         val_loader: DataLoader for validation data.
         num_epochs: Maximum number of training epochs.
-        lr: Initial learning rate.
+        lr: Learning rate.
         device: Device for training ("cuda" or "cpu").
-        checkpoint_dir: Directory to save checkpoints.
-        resume_checkpoint: Path to checkpoint to resume from.
+        checkpoint_dir: Directory for saving checkpoints.
+        resume_checkpoint: Path to checkpoint for resuming training.
         save_best: If True, saves the best model.
-        metric_to_monitor: Metric name for scheduling and early stopping.
-        mode: "min" if lower is better, "max" if higher is better.
-        patience: Patience for early stopping.
+        metric_to_monitor: Metric to monitor for early stopping.
+        mode: "min" or "max" for early stopping.
+        patience: Early stopping patience.
         min_delta: Minimum improvement for early stopping.
         use_early_stopping: If True, enables early stopping.
+        loss_fn: Loss function. Defaults to CrossEntropyLoss.
+        scheduler_factor: Factor for ReduceLROnPlateau.
+        scheduler_patience: Patience for ReduceLROnPlateau.
 
     Returns:
-        Dictionary containing training history with losses and metrics.
+        Dictionary containing training history.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
+    # Loss
     if loss_fn is not None:
         criterion = loss_fn.to(device)
     else:
         criterion = nn.CrossEntropyLoss()
 
+    # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Scheduler
     scheduler = ReduceLROnPlateau(
         optimizer,
         mode=mode,
         factor=scheduler_factor,
         patience=scheduler_patience,
     )
+
     scaler = torch.amp.GradScaler()
 
     early_stopping = (
@@ -157,9 +159,10 @@ def train_model(
         "val_acc": [],
         "train_iou": [],
         "val_iou": [],
+        "lr": [],
     }
 
-    # Resume from checkpoint if specified
+    # Resume from checkpoint
     if resume_checkpoint is not None and os.path.isfile(resume_checkpoint):
         print(f"Loading checkpoint '{resume_checkpoint}'")
         checkpoint = torch.load(
@@ -172,25 +175,25 @@ def train_model(
         best_metric = checkpoint.get("best_metric", best_metric)
         best_epoch = checkpoint.get("best_epoch", best_epoch)
         history = checkpoint.get("history", history)
+
+        # Restore early stopping state
+        if early_stopping and "early_stopping" in checkpoint:
+            early_stopping.load_state_dict(checkpoint["early_stopping"])
+            print(f"Early stopping: counter={early_stopping.counter}, best={early_stopping.best_metric:.4f}")
+
         print(f"Resuming from epoch {start_epoch} with best_metric={best_metric:.4f}")
 
     # Metrics
-    train_acc_metric = MulticlassAccuracy(
-        num_classes=NUM_CLASSES, average="macro"
-    ).to(device)
-    train_iou_metric = MulticlassJaccardIndex(
-        num_classes=NUM_CLASSES, average="macro"
-    ).to(device)
-    val_acc_metric = MulticlassAccuracy(
-        num_classes=NUM_CLASSES, average="macro"
-    ).to(device)
-    val_iou_metric = MulticlassJaccardIndex(
-        num_classes=NUM_CLASSES, average="macro"
-    ).to(device)
+    train_acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES, average="macro").to(device)
+    train_iou_metric = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average="macro").to(device)
+    val_acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES, average="macro").to(device)
+    val_iou_metric = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average="macro").to(device)
 
     use_amp = device.type == "cuda"
 
     for epoch in range(start_epoch, num_epochs):
+        current_lr = optimizer.param_groups[0]["lr"]
+
         # Training phase
         model.train()
         epoch_train_loss = 0.0
@@ -213,8 +216,10 @@ def train_model(
             masks = masks.long().to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss_value = criterion(outputs, masks)
+
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                outputs = model(images)
+                loss_value = criterion(outputs, masks)
 
             if use_amp:
                 scaler.scale(loss_value).backward()
@@ -230,7 +235,7 @@ def train_model(
             train_acc_metric.update(preds, masks)
             train_iou_metric.update(preds, masks)
 
-            loop_train.set_postfix(loss=f"{loss_value.item():.4f}")
+            loop_train.set_postfix(loss=f"{loss_value.item():.4f}", lr=f"{current_lr:.2e}")
 
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_acc = train_acc_metric.compute().item()
@@ -256,8 +261,10 @@ def train_model(
 
                 masks = masks.long().to(device, non_blocking=True)
 
-                outputs = model(images)
-                loss_value = criterion(outputs, masks)
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                    outputs = model(images)
+                    loss_value = criterion(outputs, masks)
+
                 epoch_val_loss += loss_value.item()
 
                 preds = torch.argmax(outputs, dim=1)
@@ -277,12 +284,14 @@ def train_model(
         history["val_acc"].append(val_acc)
         history["train_iou"].append(train_iou)
         history["val_iou"].append(val_iou)
+        history["lr"].append(current_lr)
 
         print(
             f"\nEpoch [{epoch + 1}/{num_epochs}] Summary:\n"
             f"  Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}\n"
             f"  Train Acc:  {train_acc:.4f} | Val Acc:  {val_acc:.4f}\n"
             f"  Train IoU:  {train_iou:.4f} | Val IoU:  {val_iou:.4f}\n"
+            f"  LR:         {current_lr:.2e}"
         )
 
         # Get current metric for monitoring
@@ -291,10 +300,9 @@ def train_model(
             "val_iou": val_iou,
             "val_acc": val_acc,
         }
-        current_metric = metric_map.get(
-            metric_to_monitor, history[metric_to_monitor][-1]
-        )
+        current_metric = metric_map.get(metric_to_monitor, avg_val_loss)
 
+        # Step scheduler
         scheduler.step(current_metric)
 
         # Check for improvement
@@ -318,15 +326,13 @@ def train_model(
                         "best_metric": best_metric,
                         "best_epoch": best_epoch,
                         "history": history,
+                        "early_stopping": early_stopping.state_dict() if early_stopping else None,
                     },
                     best_model_path,
                 )
-                print(
-                    f"[Improvement] Model saved with "
-                    f"{metric_to_monitor}: {best_metric:.4f} at epoch {epoch + 1}."
-                )
+                print(f"[Improvement] Model saved with {metric_to_monitor}: {best_metric:.4f} at epoch {best_epoch}.")
 
-        # Save current checkpoint
+        # Save checkpoint
         if checkpoint_dir:
             checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
             torch.save(
@@ -338,6 +344,7 @@ def train_model(
                     "best_metric": best_metric,
                     "best_epoch": best_epoch,
                     "history": history,
+                    "early_stopping": early_stopping.state_dict() if early_stopping else None,
                 },
                 checkpoint_path,
             )
@@ -346,20 +353,16 @@ def train_model(
         # Early stopping check
         if use_early_stopping and early_stopping is not None:
             early_stopping(current_metric)
+            print(f"Early stopping: {early_stopping.counter}/{early_stopping.patience}")
             if early_stopping.early_stop:
                 print(
                     f"Early stopping triggered at epoch {epoch + 1}. "
-                    f"Best {metric_to_monitor}: {early_stopping.best_metric:.4f}"
+                    f"Best {metric_to_monitor}: {best_metric:.4f} at epoch {best_epoch}."
                 )
                 break
 
-        # Clear GPU cache
         if use_amp and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    print(
-        f"Training completed. Best {metric_to_monitor}: "
-        f"{best_metric:.4f} at epoch {best_epoch}."
-    )
-
+    print(f"Training completed. Best {metric_to_monitor}: {best_metric:.4f} at epoch {best_epoch}.")
     return history

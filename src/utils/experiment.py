@@ -124,7 +124,7 @@ class ExperimentRunner:
         print("\n[Model]")
         print(f"  Class:           {model_class.__name__}")
         print(f"  Encoder:         tu-regnetz_d8")
-        print(f"  Encoder weights: imagenet (3 bands RGB)")
+        print(f"  Encoder weights: imagenet")
         print(f"  Input channels:  13")
         print(f"  Num classes:     4 (Clear, Thick Cloud, Thin Cloud, Shadow)")
 
@@ -161,6 +161,10 @@ class ExperimentRunner:
         for i, loss in enumerate(losses, 1):
             desc = loss_descriptions.get(loss, loss)
             print(f"  {i}. {loss:15} -> {desc}")
+
+        print("\n[Selection Criteria]")
+        print("  Best model:      Lowest val_loss")
+        print("  Best experiment: Lowest val_loss (test metrics for final report only)")
 
         print("\n[Output]")
         print(f"  Checkpoints:     {self.checkpoints_dir}")
@@ -264,12 +268,12 @@ class ExperimentRunner:
             "sched_factor": config.scheduler_factor,
             "sched_patience": config.scheduler_patience,
             "seed": config.seed,
+            "best_val_loss": checkpoint.get("best_metric", -1),
+            "best_epoch": checkpoint.get("best_epoch", -1),
             "cloud_boa": cloud_boa,
             "shadow_boa": shadow_boa,
             "valid_boa": valid_boa,
             "accuracy": metrics["Overall"]["Accuracy"],
-            "best_epoch": checkpoint.get("best_epoch", -1),
-            "best_val_loss": checkpoint.get("best_metric", -1),
             "n_params": n_params,
             "timestamp": datetime.now().isoformat(),
         }
@@ -280,11 +284,11 @@ class ExperimentRunner:
         print(f"\n{'='*60}")
         print(f"RESULTS: {config.name}")
         print(f"{'='*60}")
-        print(f"  Cloud BOA:     {cloud_boa:.4f}")
-        print(f"  Shadow BOA:    {shadow_boa:.4f}")
-        print(f"  Valid BOA:     {valid_boa:.4f}")
-        print(f"  Accuracy:      {metrics['Overall']['Accuracy']:.4f}")
-        print(f"  Best epoch:    {result['best_epoch']}")
+        print(f"  Best val_loss: {result['best_val_loss']:.4f} (epoch {result['best_epoch']})")
+        print(f"  [Test] Cloud BOA:  {cloud_boa:.4f}")
+        print(f"  [Test] Shadow BOA: {shadow_boa:.4f}")
+        print(f"  [Test] Valid BOA:  {valid_boa:.4f}")
+        print(f"  [Test] Accuracy:   {metrics['Overall']['Accuracy']:.4f}")
         print(f"{'='*60}\n")
 
         return result
@@ -464,10 +468,10 @@ class ExperimentRunner:
         return self.get_summary()
 
     def get_summary(self) -> pd.DataFrame:
-        """Get summary DataFrame of all results."""
+        """Get summary DataFrame of all results, sorted by val_loss (lower is better)."""
         df = pd.DataFrame(self.results)
         if not df.empty:
-            df = df.sort_values("cloud_boa", ascending=False)
+            df = df.sort_values("best_val_loss", ascending=True)
         return df
 
     def print_summary(self) -> None:
@@ -478,25 +482,26 @@ class ExperimentRunner:
             print("No results yet.")
             return
 
-        print("\n" + "=" * 100)
-        print("EXPERIMENT RESULTS (sorted by Cloud BOA)")
-        print("=" * 100)
+        print("\n" + "=" * 110)
+        print("EXPERIMENT RESULTS (sorted by Val Loss - lower is better)")
+        print("=" * 110)
 
         cols = [
             "name", "loss", "lr", "batch_size", "sched_factor", "sched_patience",
-            "cloud_boa", "shadow_boa", "valid_boa", "accuracy", "best_epoch", "seed"
+            "best_val_loss", "best_epoch", "cloud_boa", "shadow_boa", "accuracy", "seed"
         ]
         available_cols = [c for c in cols if c in df.columns]
         print(df[available_cols].to_string(index=False))
 
-        print("\n" + "-" * 100)
+        print("\n" + "-" * 110)
         best = df.iloc[0]
         print(f"BEST: {best['name']}")
-        print(f"  Loss: {best['loss']}, LR: {best['lr']}, BS: {best['batch_size']}")
+        print(f"  Config: loss={best['loss']}, LR={best['lr']}, BS={best['batch_size']}")
         print(f"  Scheduler: factor={best.get('sched_factor', 'N/A')}, patience={best.get('sched_patience', 'N/A')}")
-        print(f"  Cloud BOA: {best['cloud_boa']:.4f}, Shadow BOA: {best['shadow_boa']:.4f}, Accuracy: {best['accuracy']:.4f}")
+        print(f"  Val Loss: {best['best_val_loss']:.4f} (epoch {best['best_epoch']})")
+        print(f"  [Test] Cloud BOA: {best['cloud_boa']:.4f}, Shadow BOA: {best['shadow_boa']:.4f}, Accuracy: {best['accuracy']:.4f}")
         print(f"  Seed: {best.get('seed', 'N/A')}")
-        print("=" * 100 + "\n")
+        print("=" * 110 + "\n")
 
     def _save_results(self) -> None:
         """Save results to disk."""
