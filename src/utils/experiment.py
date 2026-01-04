@@ -3,6 +3,11 @@
 This module provides a systematic framework for running and comparing
 machine learning experiments for cloud segmentation, following best
 practices for reproducibility and scientific rigor.
+
+Methodology:
+- Training set: optimize model weights
+- Validation set: hyperparameter selection, early stopping, model selection
+- Test set: final evaluation only (reported in paper)
 """
 
 import os
@@ -37,52 +42,6 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-# =============================================================================
-# Selection Criteria Functions
-# =============================================================================
-
-def select_by_val_loss(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by validation loss (lower is better)."""
-    return df.sort_values("best_val_loss", ascending=True)
-
-
-def select_by_cloud_boa(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by Cloud BOA (higher is better)."""
-    return df.sort_values("cloud_boa", ascending=False)
-
-
-def select_by_mean_boa(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by mean of Cloud and Shadow BOA (higher is better)."""
-    df = df.copy()
-    df["mean_boa"] = (df["cloud_boa"] + df["shadow_boa"]) / 2
-    return df.sort_values("mean_boa", ascending=False)
-
-
-def select_by_accuracy(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by overall accuracy (higher is better)."""
-    return df.sort_values("accuracy", ascending=False)
-
-
-def select_by_composite_score(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by composite score: 0.4*cloud_boa + 0.3*shadow_boa + 0.3*accuracy."""
-    df = df.copy()
-    df["composite_score"] = (
-        0.4 * df["cloud_boa"] + 
-        0.3 * df["shadow_boa"] + 
-        0.3 * df["accuracy"]
-    )
-    return df.sort_values("composite_score", ascending=False)
-
-
-SELECTION_CRITERIA = {
-    "val_loss": select_by_val_loss,
-    "cloud_boa": select_by_cloud_boa,
-    "mean_boa": select_by_mean_boa,
-    "accuracy": select_by_accuracy,
-    "composite": select_by_composite_score,
-}
 
 
 @dataclass
@@ -129,10 +88,13 @@ class ExperimentRunner:
     
     This class provides methods for systematic experimentation including:
     - Stage 1: Loss function comparison
-    - Stage 2: Hyperparameter tuning (with multiple losses)
+    - Stage 2: Hyperparameter tuning
     - Stage 3: Scheduler tuning
     
     Results are automatically saved and can be loaded for continuation.
+    
+    IMPORTANT: Model selection is based on VALIDATION metrics.
+    Test metrics are computed for final reporting only.
     
     Attributes:
         parts: Dataset parts for tacoreader.
@@ -140,7 +102,6 @@ class ExperimentRunner:
         device: PyTorch device for training.
         seed: Global random seed.
         results: List of experiment result dictionaries.
-        selection_criterion: Function to sort/select best experiments.
     """
 
     def __init__(
@@ -149,7 +110,6 @@ class ExperimentRunner:
         base_dir: str = "/content/drive/MyDrive/pibic",
         device: str = "cuda",
         seed: int = 42,
-        selection_criterion: str = "mean_boa",
     ):
         """Initialize the experiment runner.
         
@@ -158,22 +118,12 @@ class ExperimentRunner:
             base_dir: Base directory for saving results.
             device: Device for training ("cuda" or "cpu").
             seed: Random seed for reproducibility.
-            selection_criterion: Criterion for selecting best model.
-                Options: "val_loss", "cloud_boa", "mean_boa", "accuracy", "composite"
         """
         self.parts = parts
         self.base_dir = base_dir
         self.device = device
         self.seed = seed
         self.results: List[Dict] = []
-        
-        if selection_criterion not in SELECTION_CRITERIA:
-            raise ValueError(
-                f"Unknown selection criterion: {selection_criterion}. "
-                f"Available: {list(SELECTION_CRITERIA.keys())}"
-            )
-        self.selection_criterion = selection_criterion
-        self._selection_fn = SELECTION_CRITERIA[selection_criterion]
 
         self.checkpoints_dir = os.path.join(base_dir, "checkpoints")
         self.results_dir = os.path.join(base_dir, "results")
@@ -274,16 +224,9 @@ class ExperimentRunner:
         print(f"  Scheduler:       ReduceLROnPlateau")
         print(f"  Seed:            {self.seed}")
 
-        print("\n[Selection Criterion]")
-        print(f"  Method:          {self.selection_criterion}")
-        criterion_descriptions = {
-            "val_loss": "Lowest validation loss",
-            "cloud_boa": "Highest Cloud BOA on test set",
-            "mean_boa": "Highest mean(Cloud BOA, Shadow BOA) on test set",
-            "accuracy": "Highest overall accuracy on test set",
-            "composite": "Highest 0.4*cloud + 0.3*shadow + 0.3*acc",
-        }
-        print(f"  Description:     {criterion_descriptions[self.selection_criterion]}")
+        print("\n[Evaluation Strategy]")
+        print("  Selection:       Based on VALIDATION BOA metrics")
+        print("  Test metrics:    Computed for final reporting only")
 
         print("\n[Hyperparameters to test]")
         print(f"  Learning rates:      {learning_rates}")
@@ -314,8 +257,40 @@ class ExperimentRunner:
         print(f"Total experiments planned: {total}")
         print("=" * 70 + "\n")
 
+    def _extract_boa_metrics(self, df_boa: pd.DataFrame, prefix: str = "") -> Dict:
+        """Extract BOA metrics from evaluation DataFrame.
+        
+        Args:
+            df_boa: DataFrame from evaluate_test_dataset.
+            prefix: Prefix for metric names (e.g., "val_" or "test_").
+            
+        Returns:
+            Dictionary with BOA metrics.
+        """
+        cloud_boa = float(
+            df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0]
+        )
+        shadow_boa = float(
+            df_boa[df_boa["Experiment"] == "cloud shadow"]["Median BOA"].values[0]
+        )
+        valid_boa = float(
+            df_boa[df_boa["Experiment"] == "valid/invalid"]["Median BOA"].values[0]
+        )
+        mean_boa = (cloud_boa + shadow_boa) / 2
+        
+        return {
+            f"{prefix}cloud_boa": cloud_boa,
+            f"{prefix}shadow_boa": shadow_boa,
+            f"{prefix}valid_boa": valid_boa,
+            f"{prefix}mean_boa": mean_boa,
+        }
+
     def run(self, config: ExperimentConfig, resume: bool = True) -> Optional[Dict]:
         """Run a single experiment.
+        
+        Trains model, then evaluates on BOTH validation and test sets.
+        Validation metrics are used for model selection.
+        Test metrics are for final reporting only.
         
         Args:
             config: Experiment configuration.
@@ -370,6 +345,7 @@ class ExperimentRunner:
 
         print("-" * 70)
 
+        # Training
         history = train_model(
             model=model,
             train_loader=train_loader,
@@ -393,25 +369,35 @@ class ExperimentRunner:
         model.load_state_dict(checkpoint["model_state_dict"])
         model.to(self.device).eval()
 
-        print("\nEvaluating on test set...")
-        df_boa = evaluate_test_dataset(
-            test_loader, model, device=self.device, normalize_imgs=False
+        # =====================================================================
+        # VALIDATION SET EVALUATION (for model selection)
+        # =====================================================================
+        print("\nEvaluating on VALIDATION set (for model selection)...")
+        df_boa_val = evaluate_test_dataset(
+            val_loader, model, device=self.device, normalize_imgs=False
         )
-        conf_matrix = evaluate_model(
-            test_loader, model, device=self.device, normalize_imgs=False
+        val_metrics = self._extract_boa_metrics(df_boa_val, prefix="val_")
+        
+        conf_matrix_val = evaluate_model(
+            val_loader, model, device=self.device, normalize_imgs=False
         )
-        metrics = compute_metrics(conf_matrix)
+        metrics_val = compute_metrics(conf_matrix_val)
+        val_metrics["val_accuracy"] = metrics_val["Overall"]["Accuracy"]
 
-        # Extract BOA metrics
-        cloud_boa = float(
-            df_boa[df_boa["Experiment"] == "cloud/no cloud"]["Median BOA"].values[0]
+        # =====================================================================
+        # TEST SET EVALUATION (for final reporting only)
+        # =====================================================================
+        print("Evaluating on TEST set (for final reporting)...")
+        df_boa_test = evaluate_test_dataset(
+            test_loader, model, device=self.device, normalize_imgs=False
         )
-        shadow_boa = float(
-            df_boa[df_boa["Experiment"] == "cloud shadow"]["Median BOA"].values[0]
+        test_metrics = self._extract_boa_metrics(df_boa_test, prefix="test_")
+        
+        conf_matrix_test = evaluate_model(
+            test_loader, model, device=self.device, normalize_imgs=False
         )
-        valid_boa = float(
-            df_boa[df_boa["Experiment"] == "valid/invalid"]["Median BOA"].values[0]
-        )
+        metrics_test = compute_metrics(conf_matrix_test)
+        test_metrics["test_accuracy"] = metrics_test["Overall"]["Accuracy"]
 
         # Build result dictionary
         result = {
@@ -424,11 +410,10 @@ class ExperimentRunner:
             "seed": config.seed,
             "best_val_loss": checkpoint.get("best_metric", -1),
             "best_epoch": checkpoint.get("best_epoch", -1),
-            "cloud_boa": cloud_boa,
-            "shadow_boa": shadow_boa,
-            "valid_boa": valid_boa,
-            "accuracy": metrics["Overall"]["Accuracy"],
-            "mean_boa": (cloud_boa + shadow_boa) / 2,
+            # Validation metrics (USE FOR SELECTION)
+            **val_metrics,
+            # Test metrics (USE FOR REPORTING)
+            **test_metrics,
             "n_params": n_params,
             "timestamp": datetime.now().isoformat(),
         }
@@ -440,10 +425,18 @@ class ExperimentRunner:
         print(f"RESULTS: {config.name}")
         print(f"{'='*70}")
         print(f"  Best val_loss: {result['best_val_loss']:.4f} (epoch {result['best_epoch']})")
-        print(f"  [Test] Cloud BOA:  {cloud_boa:.4f}")
-        print(f"  [Test] Shadow BOA: {shadow_boa:.4f}")
-        print(f"  [Test] Mean BOA:   {result['mean_boa']:.4f}")
-        print(f"  [Test] Accuracy:   {metrics['Overall']['Accuracy']:.4f}")
+        print(f"\n  [VALIDATION - for selection]")
+        print(f"    Cloud BOA:  {val_metrics['val_cloud_boa']:.4f}")
+        print(f"    Shadow BOA: {val_metrics['val_shadow_boa']:.4f}")
+        print(f"    Valid BOA:  {val_metrics['val_valid_boa']:.4f}")
+        print(f"    Mean BOA:   {val_metrics['val_mean_boa']:.4f}")
+        print(f"    Accuracy:   {val_metrics['val_accuracy']:.4f}")
+        print(f"\n  [TEST - for reporting]")
+        print(f"    Cloud BOA:  {test_metrics['test_cloud_boa']:.4f}")
+        print(f"    Shadow BOA: {test_metrics['test_shadow_boa']:.4f}")
+        print(f"    Valid BOA:  {test_metrics['test_valid_boa']:.4f}")
+        print(f"    Mean BOA:   {test_metrics['test_mean_boa']:.4f}")
+        print(f"    Accuracy:   {test_metrics['test_accuracy']:.4f}")
         print(f"{'='*70}\n")
 
         return result
@@ -511,7 +504,6 @@ class ExperimentRunner:
         Returns:
             Summary DataFrame of results.
         """
-        # Handle single loss or list of losses
         if isinstance(losses, str):
             losses = [losses]
             
@@ -560,7 +552,7 @@ class ExperimentRunner:
         print("\n" + "#" * 70)
         print("STAGE 2 COMPLETE")
         print("#" * 70)
-        self.print_summary()
+        self.print_summary(stage="stage2")
 
         return self.get_summary()
 
@@ -622,16 +614,23 @@ class ExperimentRunner:
         print("\n" + "#" * 70)
         print("STAGE 3 COMPLETE")
         print("#" * 70)
-        self.print_summary()
+        self.print_summary(stage="stage3")
 
         return self.get_summary()
 
-    def get_summary(self, stage: Optional[str] = None) -> pd.DataFrame:
+    def get_summary(
+        self, 
+        stage: Optional[str] = None,
+        sort_by: str = "val_mean_boa",
+        ascending: bool = False,
+    ) -> pd.DataFrame:
         """Get summary DataFrame of results.
         
         Args:
             stage: Filter by stage ("stage1", "stage2", "stage3"). 
                    If None, returns all results.
+            sort_by: Column to sort by. Default is "val_mean_boa".
+            ascending: Sort order. Default is False (higher is better).
                    
         Returns:
             Sorted DataFrame with experiment results.
@@ -645,70 +644,94 @@ class ExperimentRunner:
         if stage is not None:
             df = df[df["name"].str.startswith(stage)]
         
-        # Apply selection criterion
-        df = self._selection_fn(df)
+        # Sort
+        if sort_by in df.columns:
+            df = df.sort_values(sort_by, ascending=ascending)
         
         return df
 
-    def get_best_from_stage(self, stage: str) -> Optional[Dict]:
-        """Get best result from a specific stage.
+    def get_best_from_stage(
+        self, 
+        stage: str, 
+        sort_by: str = "val_mean_boa",
+    ) -> Optional[Dict]:
+        """Get best result from a specific stage based on VALIDATION metrics.
         
         Args:
             stage: Stage prefix ("stage1", "stage2", "stage3").
+            sort_by: Validation metric to use for selection.
             
         Returns:
             Best result dictionary or None if no results for stage.
         """
-        df = self.get_summary(stage=stage)
+        df = self.get_summary(stage=stage, sort_by=sort_by, ascending=False)
         if df.empty:
             return None
         return df.iloc[0].to_dict()
 
-    def print_summary(self, stage: Optional[str] = None) -> None:
+    def print_summary(
+        self, 
+        stage: Optional[str] = None,
+        sort_by: str = "val_mean_boa",
+    ) -> None:
         """Print formatted summary of results.
         
         Args:
             stage: Filter by stage. If None, shows all results.
+            sort_by: Column to sort by.
         """
-        df = self.get_summary(stage=stage)
+        df = self.get_summary(stage=stage, sort_by=sort_by, ascending=False)
 
         if df.empty:
             print("No results yet.")
             return
 
         stage_label = f" ({stage})" if stage else ""
-        criterion_label = self.selection_criterion.upper()
 
-        print("\n" + "=" * 120)
-        print(f"EXPERIMENT RESULTS{stage_label} - Sorted by {criterion_label}")
-        print("=" * 120)
+        print("\n" + "=" * 130)
+        print(f"EXPERIMENT RESULTS{stage_label} - Sorted by {sort_by} (VALIDATION)")
+        print("=" * 130)
 
+        # Columns for display
         cols = [
-            "name", "loss", "lr", "batch_size", "sched_factor", "sched_patience",
-            "best_val_loss", "best_epoch", "cloud_boa", "shadow_boa", "mean_boa", 
-            "accuracy", "seed"
+            "name", "loss", "lr", "batch_size",
+            "val_cloud_boa", "val_shadow_boa", "val_valid_boa", "val_mean_boa", "val_accuracy",
+            "test_mean_boa", "test_accuracy",
         ]
         available_cols = [c for c in cols if c in df.columns]
-        print(df[available_cols].to_string(index=False))
+        
+        # Format for display
+        df_display = df[available_cols].copy()
+        print(df_display.to_string(index=False))
 
-        print("\n" + "-" * 120)
+        print("\n" + "-" * 130)
         best = df.iloc[0]
-        print(f"BEST: {best['name']}")
+        print(f"BEST (by {sort_by}): {best['name']}")
         print(f"  Config: loss={best['loss']}, LR={best['lr']}, BS={best['batch_size']}")
-        print(f"  Scheduler: factor={best.get('sched_factor', 'N/A')}, patience={best.get('sched_patience', 'N/A')}")
-        print(f"  Val Loss: {best['best_val_loss']:.4f} (epoch {best['best_epoch']})")
-        print(f"  [Test] Cloud BOA: {best['cloud_boa']:.4f}")
-        print(f"  [Test] Shadow BOA: {best['shadow_boa']:.4f}")
-        print(f"  [Test] Mean BOA: {best.get('mean_boa', (best['cloud_boa']+best['shadow_boa'])/2):.4f}")
-        print(f"  [Test] Accuracy: {best['accuracy']:.4f}")
-        print(f"  Seed: {best.get('seed', 'N/A')}")
-        print("=" * 120 + "\n")
+        
+        print(f"\n  [VALIDATION - used for selection]")
+        if "val_cloud_boa" in best:
+            print(f"    Cloud BOA:  {best['val_cloud_boa']:.4f}")
+            print(f"    Shadow BOA: {best['val_shadow_boa']:.4f}")
+            print(f"    Valid BOA:  {best['val_valid_boa']:.4f}")
+            print(f"    Mean BOA:   {best['val_mean_boa']:.4f}")
+            print(f"    Accuracy:   {best['val_accuracy']:.4f}")
+        
+        print(f"\n  [TEST - for paper reporting]")
+        if "test_cloud_boa" in best:
+            print(f"    Cloud BOA:  {best['test_cloud_boa']:.4f}")
+            print(f"    Shadow BOA: {best['test_shadow_boa']:.4f}")
+            print(f"    Valid BOA:  {best['test_valid_boa']:.4f}")
+            print(f"    Mean BOA:   {best['test_mean_boa']:.4f}")
+            print(f"    Accuracy:   {best['test_accuracy']:.4f}")
+        
+        print("=" * 130 + "\n")
 
     def print_stage_comparison(self) -> None:
         """Print comparison of best results from each stage."""
-        print("\n" + "=" * 80)
-        print("STAGE COMPARISON - Best from each stage")
-        print("=" * 80)
+        print("\n" + "=" * 90)
+        print("STAGE COMPARISON - Best from each stage (by val_mean_boa)")
+        print("=" * 90)
         
         for stage in ["stage1", "stage2", "stage3"]:
             best = self.get_best_from_stage(stage)
@@ -716,11 +739,10 @@ class ExperimentRunner:
                 print(f"\n{stage.upper()}:")
                 print(f"  Name: {best['name']}")
                 print(f"  Loss: {best['loss']}, LR: {best['lr']}, BS: {best['batch_size']}")
-                print(f"  Cloud BOA: {best['cloud_boa']:.4f}, Shadow BOA: {best['shadow_boa']:.4f}")
-                print(f"  Mean BOA: {best.get('mean_boa', (best['cloud_boa']+best['shadow_boa'])/2):.4f}")
-                print(f"  Accuracy: {best['accuracy']:.4f}")
+                print(f"  [VAL]  Mean BOA: {best.get('val_mean_boa', 'N/A'):.4f}, Acc: {best.get('val_accuracy', 'N/A'):.4f}")
+                print(f"  [TEST] Mean BOA: {best.get('test_mean_boa', 'N/A'):.4f}, Acc: {best.get('test_accuracy', 'N/A'):.4f}")
         
-        print("\n" + "=" * 80)
+        print("\n" + "=" * 90)
 
     def _save_results(self) -> None:
         """Save results to disk."""
@@ -735,39 +757,47 @@ class ExperimentRunner:
         with open(pkl_path, "wb") as f:
             pickle.dump(self.results, f)
 
-    def export_for_paper(self, output_path: Optional[str] = None) -> pd.DataFrame:
+    def export_for_paper(
+        self, 
+        output_path: Optional[str] = None,
+        stage: Optional[str] = None,
+    ) -> pd.DataFrame:
         """Export results in a format suitable for academic papers.
+        
+        Uses TEST metrics for reporting (as per ML best practices).
         
         Args:
             output_path: Path to save LaTeX table. If None, only returns DataFrame.
+            stage: Filter by stage.
             
         Returns:
             Formatted DataFrame with results.
         """
-        df = self.get_summary()
+        df = self.get_summary(stage=stage)
         
         if df.empty:
             print("No results to export.")
             return df
         
-        # Select and rename columns for paper
+        # Select columns for paper (TEST metrics)
         paper_df = df[[
             "name", "loss", "lr", "batch_size", 
-            "cloud_boa", "shadow_boa", "mean_boa", "accuracy"
+            "test_cloud_boa", "test_shadow_boa", "test_valid_boa", 
+            "test_mean_boa", "test_accuracy"
         ]].copy()
         
         paper_df.columns = [
             "Experiment", "Loss", "LR", "BS",
-            "Cloud BOA", "Shadow BOA", "Mean BOA", "Accuracy"
+            "Cloud BOA", "Shadow BOA", "Valid BOA",
+            "Mean BOA", "Accuracy"
         ]
         
         # Format numeric columns
-        for col in ["Cloud BOA", "Shadow BOA", "Mean BOA", "Accuracy"]:
+        for col in ["Cloud BOA", "Shadow BOA", "Valid BOA", "Mean BOA", "Accuracy"]:
             paper_df[col] = paper_df[col].apply(lambda x: f"{x:.4f}")
         
         if output_path:
-            # Generate LaTeX table
-            latex = paper_df.to_latex(index=False, caption="Experiment Results")
+            latex = paper_df.to_latex(index=False, caption="Experiment Results (Test Set)")
             with open(output_path, "w") as f:
                 f.write(latex)
             print(f"LaTeX table saved to {output_path}")
