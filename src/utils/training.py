@@ -179,7 +179,8 @@ def train_model(
         # Restore early stopping state
         if early_stopping and "early_stopping" in checkpoint:
             early_stopping.load_state_dict(checkpoint["early_stopping"])
-            print(f"Early stopping: counter={early_stopping.counter}, best={early_stopping.best_metric:.4f}")
+            best_str = f"{early_stopping.best_metric:.4f}" if early_stopping.best_metric is not None else "N/A"
+            print(f"Early stopping: counter={early_stopping.counter}, best={best_str}")
 
         print(f"Resuming from epoch {start_epoch} with best_metric={best_metric:.4f}")
 
