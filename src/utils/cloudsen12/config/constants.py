@@ -4,7 +4,7 @@ from typing import Dict, List
 
 SENTINEL_BANDS: List[str] = [
     "B01", "B02", "B03", "B04", "B05", "B06",
-    "B07", "B08", "B8A", "B09", "B10", "B11", "B12"
+    "B07", "B08", "B8A", "B09", "B10", "B11", "B12",
 ]
 
 CLASS_NAMES: List[str] = ["Clear", "Thick Cloud", "Thin Cloud", "Cloud Shadow"]
@@ -14,7 +14,7 @@ METRIC_NAMES: List[str] = [
     "Precision",
     "Recall",
     "Omission Error",
-    "Commission Error"
+    "Commission Error",
 ]
 
 EXPERIMENTS: Dict[str, Dict[str, List[int]]] = {

@@ -1,4 +1,4 @@
-"""Results management and visualization for model comparison."""
+"""Results management and comparative visualization for model evaluation."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,22 +9,21 @@ import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
 
-from utils.constants import CLASS_NAMES, EXPERIMENTS, METRIC_NAMES
+from cloudsen12.config.constants import CLASS_NAMES, METRIC_NAMES
 
 
 @dataclass
 class ModelResult:
-    """
-    Data structure for storing model evaluation results.
+    """Stores evaluation results for a single model.
 
     Attributes:
         metrics: Per-class metrics dictionary.
         confusion_matrix: Confusion matrix as numpy array.
         overall_accuracy: Overall accuracy score.
-        timestamp: ISO format timestamp of when results were created.
+        timestamp: ISO format creation timestamp.
         boa_baseline: BOA results per experiment.
-        optimal_thresholds: Optimal threshold results per experiment.
-        additional_info: Additional metadata (parameters, GFLOPs, etc.).
+        optimal_thresholds: Threshold optimization results per experiment.
+        additional_info: Extra metadata (parameters, GFLOPs, etc.).
     """
 
     metrics: Dict
@@ -37,24 +36,18 @@ class ModelResult:
 
 
 class ResultsManager:
-    """
-    Manages model results and creates comparative visualizations.
-
-    Provides methods for storing results, parsing metrics, and generating
-    various comparison plots across multiple models.
+    """Manages model results and creates comparative visualizations.
 
     Attributes:
-        results: Dictionary mapping model names to ModelResult objects.
+        results: Mapping of model names to ModelResult objects.
     """
 
-    def __init__(self):
-        """Initialize the results manager."""
+    def __init__(self) -> None:
         self.results: Dict[str, ModelResult] = {}
         self._color_map: Dict[str, tuple] = {}
         self._palette = plt.cm.Set3(np.linspace(0, 1, 12))
 
     def _get_color(self, model_name: str) -> tuple:
-        """Get a consistent color for a model (creates one if needed)."""
         if model_name not in self._color_map:
             idx = len(self._color_map) % len(self._palette)
             self._color_map[model_name] = self._palette[idx]
@@ -68,16 +61,7 @@ class ResultsManager:
         overall_accuracy: float,
         additional_info: Optional[Dict] = None,
     ) -> None:
-        """
-        Save results for a model.
-
-        Args:
-            model_name: Name identifier for the model.
-            metrics: Per-class metrics dictionary.
-            conf_matrix: Confusion matrix.
-            overall_accuracy: Overall accuracy score.
-            additional_info: Optional additional metadata.
-        """
+        """Save evaluation results for a model."""
         self.results[model_name] = ModelResult(
             metrics=metrics,
             confusion_matrix=conf_matrix,
@@ -91,14 +75,7 @@ class ResultsManager:
         metrics_dict: Dict,
         conf_matrix: np.ndarray,
     ) -> None:
-        """
-        Convert evaluation output dictionary to internal structure.
-
-        Args:
-            model_name: Name identifier for the model.
-            metrics_dict: Raw metrics dictionary from evaluation.
-            conf_matrix: Confusion matrix.
-        """
+        """Convert raw evaluation output into internal structure."""
         parsed = {}
         for c in CLASS_NAMES:
             if c in metrics_dict:
@@ -122,15 +99,7 @@ class ResultsManager:
         threshold_results: Optional[Dict] = None,
         experiment: Optional[str] = None,
     ) -> None:
-        """
-        Save BOA baseline and/or optimal threshold results.
-
-        Args:
-            model_name: Name identifier for the model.
-            df_results: DataFrame with BOA baseline results.
-            threshold_results: Threshold optimization results.
-            experiment: Experiment name for threshold results.
-        """
+        """Save BOA baseline and/or threshold optimization results."""
         if model_name not in self.results:
             self.results[model_name] = ModelResult(
                 metrics={},
@@ -153,21 +122,19 @@ class ResultsManager:
         figsize: Tuple[int, int] = (20, 12),
         save_path: Optional[str] = None,
     ) -> None:
-        """
-        Plot a specific metric by class comparing multiple models.
+        """Plot a metric by class comparing multiple models.
 
-        Highlights the best performing model for each class with a border.
+        Highlights the best model per class with a dashed border.
 
         Args:
-            metric: Name of the metric to plot.
-            models: List of model names. If None, uses all models.
+            metric: Metric name to plot.
+            models: Model names to include. If None, uses all.
             figsize: Figure size.
-            save_path: If provided, saves the figure to this path.
+            save_path: If provided, saves the figure.
         """
         if models is None:
             models = sorted(self.results.keys())
 
-        # Validate data
         for m in models:
             for cname in CLASS_NAMES:
                 if (
@@ -176,22 +143,19 @@ class ResultsManager:
                 ):
                     raise ValueError(
                         f"Metric '{metric}' missing for class '{cname}' "
-                        f"in model '{m}'."
+                        f"in model '{m}'"
                     )
 
-        # Build values matrix [model, class]
         values_mat = np.array([
             [self.results[m].metrics[c][metric] for c in CLASS_NAMES]
             for m in models
         ])
 
-        # Find best index for each class
         if metric in ("Omission Error", "Commission Error"):
             best_idx = values_mat.argmin(axis=0)
         else:
             best_idx = values_mat.argmax(axis=0)
 
-        # Plot
         n_models = len(models)
         width = 0.8 / n_models
         x = np.arange(len(CLASS_NAMES))
@@ -202,7 +166,6 @@ class ResultsManager:
             vals = values_mat[i]
             offset = (i - n_models / 2 + 0.5) * width
             color = self._get_color(model)
-
             bars = ax.bar(x + offset, vals, width, alpha=0.85, color=color)
 
             for j, bar in enumerate(bars):
@@ -211,9 +174,7 @@ class ResultsManager:
                     bar.get_x() + bar.get_width() / 2,
                     h + 0.005,
                     f"{h:.3f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
+                    ha="center", va="bottom", fontsize=9,
                 )
                 if i == best_idx[j]:
                     bar.set_edgecolor("k")
@@ -236,12 +197,10 @@ class ResultsManager:
             loc="upper left",
         )
         ax.grid(alpha=0.3)
-
         plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
-
         plt.show()
 
     def plot_threshold_curve(
@@ -251,15 +210,7 @@ class ResultsManager:
         figsize: Tuple[int, int] = (10, 6),
         save_path: Optional[str] = None,
     ) -> None:
-        """
-        Plot median BOA vs threshold curve for an experiment.
-
-        Args:
-            model_name: Name of the model.
-            experiment: Name of the experiment.
-            figsize: Figure size.
-            save_path: If provided, saves the figure to this path.
-        """
+        """Plot median BOA vs threshold for an experiment."""
         if experiment not in self.results[model_name].optimal_thresholds:
             print(f"Experiment '{experiment}' not found for {model_name}")
             return
@@ -271,11 +222,9 @@ class ResultsManager:
         plt.scatter(
             data["best_threshold"],
             data["best_median_boa"],
-            s=100,
-            zorder=5,
+            s=100, zorder=5,
             label=f"t* = {data['best_threshold']:.2f}",
         )
-
         plt.xlabel("Threshold", fontsize=12)
         plt.ylabel("Median BOA", fontsize=12)
         plt.title(
@@ -284,27 +233,16 @@ class ResultsManager:
         )
         plt.grid(alpha=0.3)
         plt.legend(fontsize=12)
-
         plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
-
         plt.show()
 
     def get_summary_dataframe(
-        self,
-        models: Optional[List[str]] = None,
+        self, models: Optional[List[str]] = None
     ) -> pd.DataFrame:
-        """
-        Generate a summary DataFrame with key metrics for all models.
-
-        Args:
-            models: List of model names. If None, uses all models.
-
-        Returns:
-            DataFrame with model metrics summary.
-        """
+        """Generate summary DataFrame with key metrics for all models."""
         if models is None:
             models = sorted(self.results.keys())
 
@@ -315,10 +253,9 @@ class ResultsManager:
 
             for class_name in CLASS_NAMES:
                 if class_name in result.metrics:
-                    for metric in ["F1-Score", "Precision", "Recall"]:
+                    for metric in ("F1-Score", "Precision", "Recall"):
                         if metric in result.metrics[class_name]:
-                            key = f"{class_name} {metric}"
-                            row[key] = result.metrics[class_name][metric]
+                            row[f"{class_name} {metric}"] = result.metrics[class_name][metric]
 
             rows.append(row)
 

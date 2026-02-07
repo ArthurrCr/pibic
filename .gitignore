@@ -24,6 +24,3 @@ node_modules/
 
 # Ignore arquivos de dependências do Python (gerados automaticamente)
 requirements.txt
-
-# Ignore os dados
-data/

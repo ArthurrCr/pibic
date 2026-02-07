@@ -1,30 +1,30 @@
-"""Metrics computation for cloud segmentation evaluation."""
+"""Confusion-matrix based metrics for cloud segmentation evaluation."""
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import numpy as np
 import torch
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 
-from utils.constants import CLASS_NAMES, SENTINEL_BANDS
-from utils.inference import get_normalization_stats, get_predictions, normalize_images
+from cloudsen12.config.constants import CLASS_NAMES, SENTINEL_BANDS
+from cloudsen12.inference.normalization import get_normalization_stats, normalize_images
+from cloudsen12.inference.prediction import get_predictions
 
 
 def compute_metrics(conf_matrix: np.ndarray) -> Dict:
-    """
-    Compute per-class metrics from a confusion matrix.
+    """Compute per-class and overall metrics from a confusion matrix.
 
     Calculates F1-Score, Precision, Recall, Omission Error, and
     Commission Error for each class, plus overall accuracy.
 
     Args:
-        conf_matrix: Confusion matrix with shape (n_classes, n_classes).
+        conf_matrix: Confusion matrix (n_classes, n_classes).
 
     Returns:
-        Dictionary containing metrics for each class and overall statistics.
+        Dictionary with per-class metrics and overall statistics.
     """
-    metrics = {}
+    metrics: Dict = {}
 
     for i, name in enumerate(CLASS_NAMES):
         tp = conf_matrix[i, i]
@@ -59,8 +59,7 @@ def evaluate_model(
     use_ensemble: bool = True,
     normalize_imgs: bool = True,
 ) -> np.ndarray:
-    """
-    Evaluate models and return aggregated confusion matrix.
+    """Evaluate models and return the aggregated confusion matrix.
 
     Args:
         test_loader: DataLoader with test data.
@@ -70,7 +69,7 @@ def evaluate_model(
         normalize_imgs: If True, normalizes images before inference.
 
     Returns:
-        Confusion matrix with shape (4, 4).
+        Confusion matrix (4, 4).
     """
     mean, std = get_normalization_stats(device, False, SENTINEL_BANDS)
 

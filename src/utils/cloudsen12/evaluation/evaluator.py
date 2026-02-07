@@ -3,31 +3,25 @@
 import hashlib
 import pickle
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
-from utils.boa_metrics import (
+from cloudsen12.config.constants import EXPERIMENTS
+from cloudsen12.evaluation.boa import (
     evaluate_test_dataset,
     evaluate_test_dataset_with_thresholds,
     find_optimal_threshold,
 )
-from utils.constants import CLASS_NAMES, EXPERIMENTS, SENTINEL_BANDS
-from utils.inference import (
-    get_normalization_stats,
-    get_predictions,
-    normalize_images,
-)
-from utils.metrics import compute_metrics, evaluate_model
-from utils.results import ResultsManager
+from cloudsen12.evaluation.metrics import compute_metrics, evaluate_model
+from cloudsen12.evaluation.results import ResultsManager
 
 
 class ModelEvaluator:
-    """
-    Orchestrates comprehensive model evaluation with caching.
+    """Orchestrates comprehensive model evaluation with caching.
 
-    Provides methods for evaluating models on multiple metrics including
-    confusion matrix, BOA metrics, and threshold optimization.
+    Provides methods for confusion matrix evaluation, BOA metrics,
+    and threshold optimization across multiple models.
 
     Attributes:
         manager: ResultsManager instance for storing results.
@@ -40,15 +34,7 @@ class ModelEvaluator:
         manager: ResultsManager,
         device: Optional[torch.device] = None,
         cache_dir: str = "./evaluation_cache",
-    ):
-        """
-        Initialize the model evaluator.
-
-        Args:
-            manager: ResultsManager instance for storing results.
-            device: PyTorch device. If None, uses CUDA if available.
-            cache_dir: Directory for caching evaluation results.
-        """
+    ) -> None:
         self.manager = manager
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -70,12 +56,12 @@ class ModelEvaluator:
         self._load_existing_results()
 
     def _load_existing_results(self) -> None:
-        """Load existing evaluation results from cache."""
-        print("\nChecking evaluation cache...")
+        """Load previously cached evaluation results."""
+        print("Checking evaluation cache...")
         loaded_count = 0
 
         index_file = self.cache_dir / "model_index.pkl"
-        model_index = {}
+        model_index: Dict[str, str] = {}
 
         if index_file.exists():
             try:
@@ -113,23 +99,20 @@ class ModelEvaluator:
                 print(f"  Error loading {file.name}: {e}")
 
         if loaded_count > 0:
-            print(f"\n{loaded_count} evaluation(s) loaded from cache.")
+            print(f"{loaded_count} evaluation(s) loaded from cache.")
         else:
             print("No previous evaluations found.")
 
         self._model_index = model_index
 
     def _get_cache_path(self, model_name: str, eval_type: str) -> Path:
-        """Generate unique cache path based on model name and eval type."""
         name_hash = hashlib.md5(model_name.encode()).hexdigest()[:8]
         safe_name = model_name.replace("/", "-").replace(" ", "_")
         if len(safe_name) > 50:
             safe_name = safe_name[:50]
-        filename = f"{safe_name}_{name_hash}_{eval_type}.pkl"
-        return self.cache_dir / filename
+        return self.cache_dir / f"{safe_name}_{name_hash}_{eval_type}.pkl"
 
     def _save_to_cache(self, model_name: str, eval_type: str) -> None:
-        """Save current results to cache."""
         if model_name not in self.manager.results:
             return
 
@@ -137,7 +120,6 @@ class ModelEvaluator:
         with open(cache_path, "wb") as f:
             pickle.dump(self.manager.results[model_name], f)
 
-        # Update model index
         index_file = self.cache_dir / "model_index.pkl"
         self._model_index[model_name] = cache_path.name
         with open(index_file, "wb") as f:
@@ -151,35 +133,20 @@ class ModelEvaluator:
         use_ensemble: bool = False,
         normalize_imgs: bool = False,
     ) -> None:
-        """
-        Evaluate model and compute confusion matrix metrics.
-
-        Args:
-            model_name: Name identifier for the model.
-            models: Single model or list of models.
-            test_loader: DataLoader with test data.
-            use_ensemble: If True, uses ensemble prediction.
-            normalize_imgs: If True, normalizes images before inference.
-        """
-        print(f"\nEvaluating confusion matrix for: {model_name}")
+        """Evaluate model and compute confusion matrix metrics."""
+        print(f"Evaluating confusion matrix for: {model_name}")
 
         conf_matrix = evaluate_model(
-            test_loader,
-            models,
+            test_loader, models,
             device=str(self.device),
             use_ensemble=use_ensemble,
             normalize_imgs=normalize_imgs,
         )
-
         metrics = compute_metrics(conf_matrix)
         overall_acc = metrics["Overall"]["Accuracy"]
 
-        self.manager.save_model_results(
-            model_name, metrics, conf_matrix, overall_acc
-        )
-
+        self.manager.save_model_results(model_name, metrics, conf_matrix, overall_acc)
         self._save_to_cache(model_name, "evaluation_results")
-
         print(f"Overall Accuracy: {overall_acc:.4f}")
 
     def evaluate_boa_baseline(
@@ -190,21 +157,11 @@ class ModelEvaluator:
         use_ensemble: bool = False,
         normalize_imgs: bool = False,
     ) -> None:
-        """
-        Evaluate BOA baseline metrics.
-
-        Args:
-            model_name: Name identifier for the model.
-            models: Single model or list of models.
-            test_loader: DataLoader with test data.
-            use_ensemble: If True, uses ensemble prediction.
-            normalize_imgs: If True, normalizes images before inference.
-        """
-        print(f"\nEvaluating BOA baseline for: {model_name}")
+        """Evaluate BOA baseline metrics."""
+        print(f"Evaluating BOA baseline for: {model_name}")
 
         df_results = evaluate_test_dataset(
-            test_loader,
-            models,
+            test_loader, models,
             device=str(self.device),
             use_ensemble=use_ensemble,
             normalize_imgs=normalize_imgs,
@@ -212,7 +169,6 @@ class ModelEvaluator:
 
         self.manager.save_boa_results(model_name, df_results=df_results)
         self._save_to_cache(model_name, "evaluation_results")
-
         print(df_results.to_string(index=False))
 
     def find_optimal_thresholds(
@@ -224,8 +180,7 @@ class ModelEvaluator:
         normalize_imgs: bool = False,
         experiments: Optional[List[str]] = None,
     ) -> Dict[str, float]:
-        """
-        Find optimal thresholds for binary experiments.
+        """Find optimal thresholds for binary experiments.
 
         Args:
             model_name: Name identifier for the model.
@@ -233,43 +188,34 @@ class ModelEvaluator:
             val_loader: DataLoader with validation data.
             use_ensemble: If True, uses ensemble prediction.
             normalize_imgs: If True, normalizes images before inference.
-            experiments: List of experiment names. If None, uses all.
+            experiments: Experiment names. If None, uses all.
 
         Returns:
-            Dictionary mapping experiment names to optimal thresholds.
+            Mapping of experiment names to optimal thresholds.
         """
         if experiments is None:
             experiments = list(EXPERIMENTS.keys())
 
-        print(f"\nFinding optimal thresholds for: {model_name}")
-
-        optimal_thresholds = {}
+        print(f"Finding optimal thresholds for: {model_name}")
+        optimal_thresholds: Dict[str, float] = {}
 
         for experiment in experiments:
             result = find_optimal_threshold(
-                val_loader,
-                models,
-                experiment,
+                val_loader, models, experiment,
                 device=str(self.device),
                 use_ensemble=use_ensemble,
                 normalize_imgs=normalize_imgs,
             )
-
             self.manager.save_boa_results(
-                model_name,
-                threshold_results=result,
-                experiment=experiment,
+                model_name, threshold_results=result, experiment=experiment
             )
-
             optimal_thresholds[experiment] = result["best_threshold"]
-
             print(
-                f"  {experiment}: t* = {result['best_threshold']:.2f}, "
-                f"BOA = {result['best_median_boa']:.4f}"
+                f"  {experiment}: t*={result['best_threshold']:.2f}, "
+                f"BOA={result['best_median_boa']:.4f}"
             )
 
         self._save_to_cache(model_name, "evaluation_results")
-
         return optimal_thresholds
 
     def evaluate_with_thresholds(
@@ -281,28 +227,15 @@ class ModelEvaluator:
         use_ensemble: bool = False,
         normalize_imgs: bool = False,
     ) -> None:
-        """
-        Evaluate using optimal thresholds.
-
-        Args:
-            model_name: Name identifier for the model.
-            models: Single model or list of models.
-            test_loader: DataLoader with test data.
-            thresholds: Dictionary mapping experiment names to thresholds.
-            use_ensemble: If True, uses ensemble prediction.
-            normalize_imgs: If True, normalizes images before inference.
-        """
-        print(f"\nEvaluating with thresholds for: {model_name}")
+        """Evaluate using optimal thresholds."""
+        print(f"Evaluating with thresholds for: {model_name}")
 
         df_results = evaluate_test_dataset_with_thresholds(
-            test_loader,
-            models,
-            thresholds,
+            test_loader, models, thresholds,
             device=str(self.device),
             use_ensemble=use_ensemble,
             normalize_imgs=normalize_imgs,
         )
-
         print(df_results.to_string(index=False))
 
     def full_evaluation(
@@ -314,20 +247,11 @@ class ModelEvaluator:
         use_ensemble: Optional[bool] = None,
         normalize_imgs: Optional[bool] = None,
     ) -> None:
-        """
-        Run complete evaluation pipeline.
+        """Run complete evaluation pipeline.
 
-        Includes confusion matrix, BOA baseline, and threshold optimization.
-
-        Args:
-            model_name: Name identifier for the model.
-            models: Single model or list of models.
-            test_loader: DataLoader with test data.
-            val_loader: DataLoader with validation data (for threshold optimization).
-            use_ensemble: If True, uses ensemble prediction.
-            normalize_imgs: If True, normalizes images before inference.
+        Includes confusion matrix, BOA baseline, and optional threshold
+        optimization (when val_loader is provided).
         """
-        # Get config defaults
         if model_name in self.model_configs:
             config = self.model_configs[model_name]
             if use_ensemble is None:
@@ -338,34 +262,29 @@ class ModelEvaluator:
             use_ensemble = use_ensemble if use_ensemble is not None else False
             normalize_imgs = normalize_imgs if normalize_imgs is not None else False
 
-        print(f"\n{'=' * 60}")
+        separator = "=" * 60
+        print(f"\n{separator}")
         print(f"FULL EVALUATION: {model_name}")
-        print(f"{'=' * 60}")
+        print(f"{separator}")
         print(f"use_ensemble: {use_ensemble}")
         print(f"normalize_imgs: {normalize_imgs}")
 
-        # Confusion matrix evaluation
         self.evaluate_confusion_matrix(
             model_name, models, test_loader, use_ensemble, normalize_imgs
         )
-
-        # BOA baseline
         self.evaluate_boa_baseline(
             model_name, models, test_loader, use_ensemble, normalize_imgs
         )
 
-        # Threshold optimization (if val_loader provided)
         if val_loader is not None:
             thresholds = self.find_optimal_thresholds(
                 model_name, models, val_loader, use_ensemble, normalize_imgs
             )
-
-            # Evaluate with optimal thresholds
             self.evaluate_with_thresholds(
                 model_name, models, test_loader, thresholds,
-                use_ensemble, normalize_imgs
+                use_ensemble, normalize_imgs,
             )
 
-        print(f"\n{'=' * 60}")
+        print(f"\n{separator}")
         print(f"EVALUATION COMPLETE: {model_name}")
-        print(f"{'=' * 60}")
+        print(separator)

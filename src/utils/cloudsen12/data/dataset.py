@@ -10,10 +10,10 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class CloudSEN12Dataset(Dataset):
-    """
-    PyTorch Dataset for CloudSEN12 satellite imagery.
+    """PyTorch Dataset for CloudSEN12 satellite imagery.
 
-    Loads Sentinel-2 images and corresponding cloud masks from a TortillaDataFrame.
+    Loads Sentinel-2 images and corresponding cloud masks from a
+    TortillaDataFrame.
     """
 
     def __init__(
@@ -21,15 +21,7 @@ class CloudSEN12Dataset(Dataset):
         tdf: Any,
         cache_enabled: bool = False,
         normalize: bool = False,
-    ):
-        """
-        Initialize the dataset.
-
-        Args:
-            tdf: TortillaDataFrame already filtered for desired samples.
-            cache_enabled: If True, stores data in memory (higher RAM usage).
-            normalize: If True, normalizes images by dividing by 10,000.
-        """
+    ) -> None:
         self.tdf = tdf
         self.cache_enabled = cache_enabled
         self.cache: Dict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]] = {}
@@ -58,13 +50,11 @@ class CloudSEN12Dataset(Dataset):
 
         img_tensor = torch.from_numpy(img_data).float()
         mask_tensor = torch.from_numpy(mask_data).long()
-
         return img_tensor, mask_tensor
 
     def _read_files(
         self, img_path: str, mask_path: str
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Read image and mask files using rasterio."""
         with rio.open(img_path) as src:
             img_data = src.read()
         with rio.open(mask_path) as msk:
@@ -73,8 +63,7 @@ class CloudSEN12Dataset(Dataset):
 
 
 class MaskBandDataset(Dataset):
-    """
-    Dataset wrapper that masks a specific band with a fill value.
+    """Dataset wrapper that masks a specific band with a fill value.
 
     Useful for ablation studies to evaluate band importance.
     """
@@ -84,15 +73,7 @@ class MaskBandDataset(Dataset):
         base_dataset: CloudSEN12Dataset,
         band_idx: int,
         fill_value: float = 0.0,
-    ):
-        """
-        Initialize the mask band dataset.
-
-        Args:
-            base_dataset: Original CloudSEN12Dataset instance.
-            band_idx: Index of the band to be masked.
-            fill_value: Value to fill the masked band (default: 0.0).
-        """
+    ) -> None:
         self.base_dataset = base_dataset
         self.band_idx = band_idx
         self.fill_value = fill_value
@@ -117,92 +98,75 @@ def create_dataloaders(
     normalize: bool = False,
     seed: int = 42,
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
-    """
-    Create train, validation, and test DataLoaders from dataset parts.
+    """Create train, validation, and test DataLoaders from dataset parts.
 
     Args:
         parts: Dataset parts to load via tacoreader.
         real_proj_shape: Expected projection shape for filtering.
-        label_type: Label quality type ("high", "low", etc.).
+        label_type: Label quality type.
         batch_size: Batch size for DataLoaders.
-        num_workers: Number of worker processes for data loading.
-        cache_enabled: If True, enables caching in datasets.
-        normalize: If True, normalizes images.
+        num_workers: Number of worker processes.
+        cache_enabled: If True, enables in-memory caching.
+        normalize: If True, normalizes images by dividing by 10000.
         seed: Random seed for reproducibility.
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader). Any loader may be
-        None if the corresponding split has no samples.
+        Tuple of (train_loader, val_loader, test_loader). Any loader may
+        be None if the corresponding split has no samples.
     """
     ds = tacoreader.load(parts)
 
-    train_tdf = ds[
-        (ds["real_proj_shape"] == real_proj_shape)
-        & (ds["label_type"] == label_type)
-        & (ds["tortilla:data_split"] == "train")
-    ]
-    val_tdf = ds[
-        (ds["real_proj_shape"] == real_proj_shape)
-        & (ds["label_type"] == label_type)
-        & (ds["tortilla:data_split"] == "validation")
-    ]
-    test_tdf = ds[
-        (ds["real_proj_shape"] == real_proj_shape)
-        & (ds["label_type"] == label_type)
-        & (ds["tortilla:data_split"] == "test")
-    ]
+    splits = {}
+    for split_name in ("train", "validation", "test"):
+        tdf = ds[
+            (ds["real_proj_shape"] == real_proj_shape)
+            & (ds["label_type"] == label_type)
+            & (ds["tortilla:data_split"] == split_name)
+        ]
+        splits[split_name] = tdf
 
-    print(f"Train samples: {len(train_tdf)}")
-    print(f"Val samples:   {len(val_tdf)}")
-    print(f"Test samples:  {len(test_tdf)}")
+    print(f"Train samples: {len(splits['train'])}")
+    print(f"Val samples:   {len(splits['validation'])}")
+    print(f"Test samples:  {len(splits['test'])}")
 
-    train_dataset = (
-        CloudSEN12Dataset(train_tdf, cache_enabled, normalize)
-        if len(train_tdf)
+    datasets = {
+        name: CloudSEN12Dataset(tdf, cache_enabled, normalize)
+        if len(tdf)
         else None
-    )
-    val_dataset = (
-        CloudSEN12Dataset(val_tdf, cache_enabled, normalize)
-        if len(val_tdf)
-        else None
-    )
-    test_dataset = (
-        CloudSEN12Dataset(test_tdf, cache_enabled, normalize)
-        if len(test_tdf)
-        else None
-    )
+        for name, tdf in splits.items()
+    }
 
     generator = torch.Generator().manual_seed(seed)
 
     train_loader = (
         DataLoader(
-            train_dataset,
+            datasets["train"],
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
             generator=generator,
         )
-        if train_dataset
+        if datasets["train"]
         else None
     )
     val_loader = (
         DataLoader(
-            val_dataset,
+            datasets["validation"],
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
         )
-        if val_dataset
+        if datasets["validation"]
         else None
     )
     test_loader = (
         DataLoader(
-            test_dataset,
+            datasets["test"],
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
         )
-        if test_dataset
+        if datasets["test"]
         else None
     )
 
