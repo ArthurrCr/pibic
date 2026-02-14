@@ -8,7 +8,7 @@ import pandas as pd
 import torch.nn as nn
 
 from cloudsen12.experiment.config import ExperimentConfig
-from cloudsen12.experiment.reporting import print_summary
+from cloudsen12.experiment.reporting import get_summary, print_summary
 
 if TYPE_CHECKING:
     from cloudsen12.experiment.runner import ExperimentRunner
@@ -188,20 +188,3 @@ def run_scheduler_tuning(
     print_summary(runner, stage="stage3")
 
     return get_summary(runner)
-
-
-def get_summary(
-    runner: ExperimentRunner,
-    stage: Optional[str] = None,
-    sort_by: str = "val_mean_boa",
-    ascending: bool = False,
-) -> pd.DataFrame:
-    """Get summary DataFrame, optionally filtered by stage."""
-    df = pd.DataFrame(runner.results)
-    if df.empty:
-        return df
-    if stage is not None:
-        df = df[df["name"].str.startswith(stage)]
-    if sort_by in df.columns:
-        df = df.sort_values(sort_by, ascending=ascending)
-    return df
