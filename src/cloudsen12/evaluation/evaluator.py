@@ -3,9 +3,12 @@
 import hashlib
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
+import pandas as pd
 import torch
+from scipy.stats import wilcoxon
 
 from cloudsen12.evaluation.boa import evaluate_test_dataset
 from cloudsen12.evaluation.metrics import compute_metrics, evaluate_model
@@ -16,15 +19,16 @@ class ModelEvaluator:
     """Orchestrates model evaluation with caching.
 
     Runs confusion matrix computation and patch-level BOA evaluation,
-    persisting results to disk for reproducibility.
+    persisting results to disk for reproducibility. Supports paired
+    statistical comparison between models via Wilcoxon signed-rank test.
 
     Attributes:
         manager: ResultsManager instance for storing results.
         device: PyTorch device for computation.
         cache_dir: Directory for caching evaluation results.
+        patch_data: Per-patch BOA data keyed by model name.
     """
 
-    # Models that require special inference settings.
     DEFAULT_MODEL_CONFIGS: Dict[str, Dict[str, bool]] = {
         "CloudS2Mask ensemble": {
             "use_ensemble": True,
@@ -57,6 +61,7 @@ class ModelEvaluator:
         print(f"Cache directory: {self.cache_dir}")
 
         self.model_configs = dict(self.DEFAULT_MODEL_CONFIGS)
+        self.patch_data: Dict[str, pd.DataFrame] = {}
         self._model_index: Dict[str, str] = {}
         self._load_existing_results()
 
@@ -103,6 +108,18 @@ class ModelEvaluator:
             except Exception as e:
                 print(f"  Error loading {file.name}: {e}")
 
+        # Load cached per-patch data.
+        for file in self.cache_dir.glob("*_patch_data.pkl"):
+            try:
+                with open(file, "rb") as f:
+                    data = pickle.load(f)
+                model_name = data.get("model_name")
+                if model_name and "patch_df" in data:
+                    self.patch_data[model_name] = data["patch_df"]
+                    print(f"  Loaded patch data: {model_name}")
+            except Exception as e:
+                print(f"  Error loading {file.name}: {e}")
+
         if loaded_count > 0:
             print(f"{loaded_count} evaluation(s) loaded from cache.")
         else:
@@ -131,6 +148,17 @@ class ModelEvaluator:
         self._model_index[model_name] = cache_path.name
         with open(index_file, "wb") as f:
             pickle.dump(self._model_index, f)
+
+    def _save_patch_data(self, model_name: str) -> None:
+        """Persist per-patch BOA data to disk."""
+        if model_name not in self.patch_data:
+            return
+        cache_path = self._get_cache_path(model_name, "patch_data")
+        with open(cache_path, "wb") as f:
+            pickle.dump(
+                {"model_name": model_name, "patch_df": self.patch_data[model_name]},
+                f,
+            )
 
     def evaluate_confusion_matrix(
         self,
@@ -169,16 +197,18 @@ class ModelEvaluator:
         """Evaluate patch-level BOA metrics with argmax predictions."""
         print(f"Evaluating BOA for: {model_name}")
 
-        df_results = evaluate_test_dataset(
+        summary_df, patch_df = evaluate_test_dataset(
             test_loader, models,
             device=str(self.device),
             use_ensemble=use_ensemble,
             normalize_imgs=normalize_imgs,
         )
 
-        self.manager.save_boa_results(model_name, df_results=df_results)
+        self.manager.save_boa_results(model_name, df_results=summary_df)
+        self.patch_data[model_name] = patch_df
         self._save_to_cache(model_name, "evaluation_results")
-        print(df_results.to_string(index=False))
+        self._save_patch_data(model_name)
+        print(summary_df.to_string(index=False))
 
     def full_evaluation(
         self,
@@ -221,3 +251,125 @@ class ModelEvaluator:
         print(f"\n{separator}")
         print(f"EVALUATION COMPLETE: {model_name}")
         print(separator)
+
+    # ------------------------------------------------------------------
+    # Statistical comparison
+    # ------------------------------------------------------------------
+
+    def wilcoxon_test(
+        self,
+        model_a: str,
+        model_b: str,
+        experiments: Optional[List[str]] = None,
+        alternative: str = "two-sided",
+    ) -> pd.DataFrame:
+        """Run paired Wilcoxon signed-rank test on per-patch BOA.
+
+        Compares model_a vs model_b for each binary experiment. Patches
+        where either model has NaN BOA are excluded from the test.
+
+        Args:
+            model_a: Name of the first model (expected to be better).
+            model_b: Name of the second model (baseline).
+            experiments: Experiment names to compare. If None, uses all
+                experiments present in the patch data.
+            alternative: 'two-sided', 'greater', or 'less'. Use 'greater'
+                to test H1: model_a > model_b.
+
+        Returns:
+            DataFrame with columns: experiment, n_patches, median_a,
+            median_b, median_diff, statistic, p_value, significant.
+
+        Raises:
+            ValueError: If patch data is missing for either model.
+        """
+        for name in (model_a, model_b):
+            if name not in self.patch_data:
+                raise ValueError(
+                    f"No patch data for '{name}'. "
+                    f"Run full_evaluation first."
+                )
+
+        df_a = self.patch_data[model_a]
+        df_b = self.patch_data[model_b]
+
+        if experiments is None:
+            experiments = sorted(df_a["experiment"].unique())
+
+        rows = []
+        for exp in experiments:
+            boa_a = df_a.loc[df_a["experiment"] == exp, "BOA"].values
+            boa_b = df_b.loc[df_b["experiment"] == exp, "BOA"].values
+
+            if len(boa_a) != len(boa_b):
+                print(
+                    f"  WARNING: patch count mismatch for {exp} "
+                    f"({len(boa_a)} vs {len(boa_b)}). Skipping."
+                )
+                continue
+
+            # Drop patches where either model has NaN.
+            valid = ~(np.isnan(boa_a) | np.isnan(boa_b))
+            boa_a_valid = boa_a[valid]
+            boa_b_valid = boa_b[valid]
+            n_valid = int(valid.sum())
+
+            diff = boa_a_valid - boa_b_valid
+
+            # Wilcoxon requires at least one non-zero difference.
+            if np.all(diff == 0) or n_valid < 10:
+                rows.append({
+                    "experiment": exp,
+                    "n_patches": n_valid,
+                    "median_a": np.nanmedian(boa_a_valid),
+                    "median_b": np.nanmedian(boa_b_valid),
+                    "median_diff": np.nanmedian(diff),
+                    "statistic": np.nan,
+                    "p_value": np.nan,
+                    "significant": False,
+                })
+                continue
+
+            stat, p_val = wilcoxon(
+                boa_a_valid, boa_b_valid, alternative=alternative
+            )
+
+            rows.append({
+                "experiment": exp,
+                "n_patches": n_valid,
+                "median_a": np.nanmedian(boa_a_valid),
+                "median_b": np.nanmedian(boa_b_valid),
+                "median_diff": np.nanmedian(diff),
+                "statistic": stat,
+                "p_value": p_val,
+                "significant": p_val < 0.05,
+            })
+
+        result_df = pd.DataFrame(rows)
+
+        # Print results.
+        separator = "=" * 80
+        print(f"\n{separator}")
+        print(f"WILCOXON SIGNED-RANK TEST (alternative='{alternative}')")
+        print(f"  Model A: {model_a}")
+        print(f"  Model B: {model_b}")
+        print(separator)
+
+        for _, row in result_df.iterrows():
+            sig = "***" if row["p_value"] < 0.001 else (
+                "**" if row["p_value"] < 0.01 else (
+                    "*" if row["p_value"] < 0.05 else "n.s."
+                )
+            )
+            print(
+                f"  {row['experiment']:20s}  "
+                f"n={row['n_patches']:4d}  "
+                f"median_A={row['median_a']:.4f}  "
+                f"median_B={row['median_b']:.4f}  "
+                f"diff={row['median_diff']:+.4f}  "
+                f"W={row['statistic']:10.1f}  "
+                f"p={row['p_value']:.2e}  {sig}"
+            )
+
+        print(separator)
+        return result_df

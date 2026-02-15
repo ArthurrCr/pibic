@@ -86,13 +86,34 @@ def _build_summary_table(exps: Dict[str, Dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _build_patch_dataframe(exps: Dict[str, Dict]) -> pd.DataFrame:
+    """Build a DataFrame with per-patch metrics for each experiment.
+
+    Returns:
+        DataFrame with columns: patch_idx, experiment, BOA, PA, UA.
+    """
+    rows = []
+    for name, cfg in exps.items():
+        for i, (boa, pa, ua) in enumerate(
+            zip(cfg["BOA"], cfg["PA"], cfg["UA"])
+        ):
+            rows.append({
+                "patch_idx": i,
+                "experiment": name,
+                "BOA": boa,
+                "PA": pa,
+                "UA": ua,
+            })
+    return pd.DataFrame(rows)
+
+
 def evaluate_test_dataset(
     test_loader: torch.utils.data.DataLoader,
     models: Union[torch.nn.Module, List[torch.nn.Module]],
     device: str = "cuda",
     use_ensemble: bool = True,
     normalize_imgs: bool = True,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Compute patch-level BOA using argmax predictions.
 
     Evaluates each binary experiment defined in EXPERIMENTS by computing
@@ -107,7 +128,9 @@ def evaluate_test_dataset(
         normalize_imgs: If True, normalizes images before inference.
 
     Returns:
-        DataFrame with summary statistics for each experiment.
+        Tuple of (summary_df, patch_df):
+            summary_df: Median BOA and PA/UA bucket percentages.
+            patch_df: Per-patch BOA, PA, UA for each experiment.
     """
     mean, std = get_normalization_stats(device, False, SENTINEL_BANDS)
     models = _prepare_models(models, device)
@@ -146,4 +169,6 @@ def evaluate_test_dataset(
                     for key in ("PA", "UA", "BOA", "OE", "CE"):
                         cfg[key].append(stats[key])
 
-    return _build_summary_table(exps)
+    summary_df = _build_summary_table(exps)
+    patch_df = _build_patch_dataframe(exps)
+    return summary_df, patch_df
