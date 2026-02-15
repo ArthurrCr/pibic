@@ -8,7 +8,7 @@ import torch
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 
-from cloudsen12.config.constants import EXPERIMENTS, SENTINEL_BANDS
+from cloudsen12.config.constants import CLASS_NAMES, EXPERIMENTS, NUM_CLASSES, SENTINEL_BANDS
 from cloudsen12.inference.normalization import get_normalization_stats, normalize_images
 from cloudsen12.inference.prediction import get_predictions
 
@@ -172,3 +172,49 @@ def evaluate_test_dataset(
     summary_df = _build_summary_table(exps)
     patch_df = _build_patch_dataframe(exps)
     return summary_df, patch_df
+
+
+# ------------------------------------------------------------------
+# Ground-truth statistics for stratified error analysis
+# ------------------------------------------------------------------
+
+
+def compute_patch_gt_stats(
+    test_loader: torch.utils.data.DataLoader,
+) -> pd.DataFrame:
+    """Compute per-patch class distribution from ground-truth labels.
+
+    Iterates through the test loader once (no model needed) and returns
+    the fraction of pixels belonging to each class for every patch.
+
+    Args:
+        test_loader: DataLoader yielding (images, labels) batches.
+
+    Returns:
+        DataFrame with columns:
+            patch_idx, frac_clear, frac_thick_cloud, frac_thin_cloud,
+            frac_shadow, cloud_cover, has_shadow, has_thin_cloud.
+    """
+    rows: List[Dict] = []
+    patch_idx = 0
+
+    for _, gts in tqdm(test_loader, desc="Computing GT stats"):
+        for gt in gts.numpy():
+            n_pixels = float(gt.size)
+            counts = np.bincount(gt.ravel(), minlength=NUM_CLASSES)
+            fracs = counts / n_pixels
+
+            rows.append({
+                "patch_idx": patch_idx,
+                "frac_clear": fracs[0],
+                "frac_thick_cloud": fracs[1],
+                "frac_thin_cloud": fracs[2],
+                "frac_shadow": fracs[3],
+                # Combined cloud cover = thick + thin
+                "cloud_cover": fracs[1] + fracs[2],
+                "has_shadow": fracs[3] > 0.0,
+                "has_thin_cloud": fracs[2] > 0.0,
+            })
+            patch_idx += 1
+
+    return pd.DataFrame(rows)

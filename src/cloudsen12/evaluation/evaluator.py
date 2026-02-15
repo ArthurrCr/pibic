@@ -10,7 +10,8 @@ import pandas as pd
 import torch
 from scipy.stats import wilcoxon
 
-from cloudsen12.evaluation.boa import evaluate_test_dataset
+from cloudsen12.config.constants import CLASS_NAMES, NUM_CLASSES
+from cloudsen12.evaluation.boa import compute_patch_gt_stats, evaluate_test_dataset
 from cloudsen12.evaluation.metrics import compute_metrics, evaluate_model
 from cloudsen12.evaluation.results import ResultsManager
 
@@ -27,6 +28,7 @@ class ModelEvaluator:
         device: PyTorch device for computation.
         cache_dir: Directory for caching evaluation results.
         patch_data: Per-patch BOA data keyed by model name.
+        gt_stats: Per-patch ground-truth class fractions (computed once).
     """
 
     DEFAULT_MODEL_CONFIGS: Dict[str, Dict[str, bool]] = {
@@ -62,8 +64,13 @@ class ModelEvaluator:
 
         self.model_configs = dict(self.DEFAULT_MODEL_CONFIGS)
         self.patch_data: Dict[str, pd.DataFrame] = {}
+        self.gt_stats: Optional[pd.DataFrame] = None
         self._model_index: Dict[str, str] = {}
         self._load_existing_results()
+
+    # ------------------------------------------------------------------
+    # Cache management
+    # ------------------------------------------------------------------
 
     def _load_existing_results(self) -> None:
         """Load previously cached evaluation results."""
@@ -120,6 +127,16 @@ class ModelEvaluator:
             except Exception as e:
                 print(f"  Error loading {file.name}: {e}")
 
+        # Load cached GT stats.
+        gt_cache = self.cache_dir / "gt_stats.pkl"
+        if gt_cache.exists():
+            try:
+                with open(gt_cache, "rb") as f:
+                    self.gt_stats = pickle.load(f)
+                print(f"  Loaded GT stats ({len(self.gt_stats)} patches)")
+            except Exception as e:
+                print(f"  Error loading gt_stats: {e}")
+
         if loaded_count > 0:
             print(f"{loaded_count} evaluation(s) loaded from cache.")
         else:
@@ -159,6 +176,17 @@ class ModelEvaluator:
                 {"model_name": model_name, "patch_df": self.patch_data[model_name]},
                 f,
             )
+
+    def _save_gt_stats(self) -> None:
+        """Persist GT stats to disk."""
+        if self.gt_stats is None:
+            return
+        with open(self.cache_dir / "gt_stats.pkl", "wb") as f:
+            pickle.dump(self.gt_stats, f)
+
+    # ------------------------------------------------------------------
+    # Core evaluation
+    # ------------------------------------------------------------------
 
     def evaluate_confusion_matrix(
         self,
@@ -373,3 +401,193 @@ class ModelEvaluator:
 
         print(separator)
         return result_df
+
+    # ------------------------------------------------------------------
+    # Stratified error analysis
+    # ------------------------------------------------------------------
+
+    def compute_gt_stats(
+        self,
+        test_loader: torch.utils.data.DataLoader,
+        force: bool = False,
+    ) -> pd.DataFrame:
+        """Compute and cache per-patch GT class fractions.
+
+        Only iterates through the loader if gt_stats is not already
+        cached (in memory or on disk). Use force=True to recompute.
+
+        Args:
+            test_loader: DataLoader with test data.
+            force: If True, recompute even if cached.
+
+        Returns:
+            DataFrame with per-patch class fractions.
+        """
+        if self.gt_stats is not None and not force:
+            print(f"GT stats already loaded ({len(self.gt_stats)} patches).")
+            return self.gt_stats
+
+        self.gt_stats = compute_patch_gt_stats(test_loader)
+        self._save_gt_stats()
+        print(f"Computed GT stats for {len(self.gt_stats)} patches.")
+        return self.gt_stats
+
+    def stratified_analysis(
+        self,
+        model_names: Optional[List[str]] = None,
+        experiment: str = "cloud/no cloud",
+        stratify_by: str = "cloud_cover",
+        bins: Optional[List[float]] = None,
+        bin_labels: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Analyze BOA stratified by GT patch characteristics.
+
+        Groups patches into bins based on a GT statistic (e.g., cloud
+        coverage fraction) and computes median BOA per bin per model.
+
+        Args:
+            model_names: Models to include. If None, uses all in patch_data.
+            experiment: Which binary experiment to analyze.
+            stratify_by: Column from gt_stats to bin by.
+                Options: 'cloud_cover', 'frac_shadow', 'frac_thin_cloud',
+                'frac_thick_cloud', 'frac_clear'.
+            bins: Bin edges. Defaults to [0, 0.1, 0.3, 0.6, 1.0].
+            bin_labels: Labels for each bin. Must have len(bins)-1 items.
+
+        Returns:
+            DataFrame with columns: bin, model, n_patches, median_BOA,
+            q25_BOA, q75_BOA.
+
+        Raises:
+            ValueError: If gt_stats or patch_data is missing.
+        """
+        if self.gt_stats is None:
+            raise ValueError(
+                "No GT stats available. Call compute_gt_stats(test_loader) first."
+            )
+
+        if model_names is None:
+            model_names = list(self.patch_data.keys())
+
+        if bins is None:
+            bins = [0.0, 0.1, 0.3, 0.6, 1.01]
+        if bin_labels is None:
+            bin_labels = [
+                f"{bins[i]:.0%}–{bins[i+1]:.0%}"
+                for i in range(len(bins) - 1)
+            ]
+            # Clean up the last label if 1.01
+            bin_labels[-1] = bin_labels[-1].replace("101%", "100%")
+
+        gt = self.gt_stats.copy()
+        gt["bin"] = pd.cut(
+            gt[stratify_by], bins=bins, labels=bin_labels,
+            include_lowest=True, right=True,
+        )
+
+        rows = []
+        for model_name in model_names:
+            if model_name not in self.patch_data:
+                print(f"  WARNING: no patch data for '{model_name}', skipping.")
+                continue
+
+            df = self.patch_data[model_name]
+            df_exp = df[df["experiment"] == experiment].copy()
+            merged = df_exp.merge(gt[["patch_idx", "bin"]], on="patch_idx")
+
+            for bin_label in bin_labels:
+                subset = merged[merged["bin"] == bin_label]["BOA"].dropna()
+                rows.append({
+                    "bin": bin_label,
+                    "model": model_name,
+                    "n_patches": len(subset),
+                    "median_BOA": np.nanmedian(subset) if len(subset) > 0 else np.nan,
+                    "q25_BOA": np.nanpercentile(subset, 25) if len(subset) > 0 else np.nan,
+                    "q75_BOA": np.nanpercentile(subset, 75) if len(subset) > 0 else np.nan,
+                })
+
+        result_df = pd.DataFrame(rows)
+
+        # Print summary table.
+        separator = "=" * 90
+        print(f"\n{separator}")
+        print(f"STRATIFIED ANALYSIS: {experiment} by {stratify_by}")
+        print(separator)
+        print(f"{'Bin':>12s}", end="")
+        for m in model_names:
+            short = m[:20]
+            print(f"  {short:>22s}", end="")
+        print(f"  {'N':>6s}")
+        print("-" * 90)
+
+        for bin_label in bin_labels:
+            print(f"{bin_label:>12s}", end="")
+            bin_data = result_df[result_df["bin"] == bin_label]
+            n = 0
+            for m in model_names:
+                row = bin_data[bin_data["model"] == m]
+                if len(row) > 0:
+                    med = row.iloc[0]["median_BOA"]
+                    n = row.iloc[0]["n_patches"]
+                    print(f"  {med:>22.4f}", end="")
+                else:
+                    print(f"  {'N/A':>22s}", end="")
+            print(f"  {n:>6d}")
+
+        print(separator)
+        return result_df
+
+    def class_confusion_analysis(
+        self,
+        model_name: str,
+    ) -> pd.DataFrame:
+        """Analyze inter-class confusion from the stored confusion matrix.
+
+        For each class, shows what fraction of its pixels were predicted
+        as each other class. Useful for understanding systematic errors
+        like thin cloud missed as clear, or shadow confused with water.
+
+        Args:
+            model_name: Name of the model to analyze.
+
+        Returns:
+            DataFrame with row-normalized confusion percentages.
+
+        Raises:
+            ValueError: If no results exist for the model.
+        """
+        if model_name not in self.manager.results:
+            raise ValueError(f"No results for '{model_name}'.")
+
+        result = self.manager.results[model_name]
+        cm = result.conf_matrix
+
+        # Row-normalize to percentages.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cm_pct = cm.astype(float) / cm.sum(axis=1, keepdims=True) * 100
+        cm_pct = np.nan_to_num(cm_pct)
+
+        df = pd.DataFrame(
+            cm_pct,
+            index=[f"True: {c}" for c in CLASS_NAMES],
+            columns=[f"Pred: {c}" for c in CLASS_NAMES],
+        )
+
+        separator = "=" * 80
+        print(f"\n{separator}")
+        print(f"CLASS CONFUSION ANALYSIS: {model_name}")
+        print(separator)
+        print(df.to_string(float_format=lambda x: f"{x:.1f}%"))
+
+        # Highlight key error patterns.
+        print(f"\nKey error patterns:")
+        for i, true_cls in enumerate(CLASS_NAMES):
+            for j, pred_cls in enumerate(CLASS_NAMES):
+                if i != j and cm_pct[i, j] > 3.0:
+                    print(
+                        f"  {true_cls} → {pred_cls}: "
+                        f"{cm_pct[i, j]:.1f}% ({cm[i, j]:,} pixels)"
+                    )
+
+        print(separator)
+        return df
